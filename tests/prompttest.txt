@@ -1,0 +1,18 @@
+dcr list and dce list are empty. Fix it.
+I want the JSON content of the DCR and DCE
+I want explicit if the Cluster is associated to an AMPLS or not. DOn't give me empty result
+If is associated to an AMPLS, give me the AMPLS resource ID
+I don' need aks-authentication information, account-show.json,  aks-show.json, monitor-workspace.json, aks-authentication.txt, aks-get-credentials.txt, kube-system-pods.json
+I want status from ama-metrics pods
+I want logs from ama-metrics pods, container prometheus-collector
+Use one of ama-metrics pods to collect any important information from inside this container. I want all important files about metrics collection from container "prometheus-collector". Any information about errors or warning messages.
+i want only the configmaps lists according to the two documents below: 
+- https://learn.microsoft.com/en-us/azure/azure-monitor/containers/prometheus-metrics-scrape-configuration
+- https://learn.microsoft.com/en-us/azure/azure-monitor/containers/prometheus-metrics-scrape-configmap
+Any other configmap can be ignored.
+I want the content of configmaps, when exist. Give me in read format
+I want podmonitor and servicemonitor CRDs, when exist, according to the document - https://learn.microsoft.com/en-us/azure/azure-monitor/containers/prometheus-metrics-scrape-crd
+GIve me the content from each when exist. Give me in read format.The azure monitor workspace, i don't need the JSON cpayload. I want to know if is public enabled or not.
+GIve me the ingestion status according to https://learn.microsoft.com/en-us/azure/azure-monitor/metrics/azure-monitor-workspace-monitor-ingest-limits?tabs=portal
+I want to know the ingestion limits: "Events per minute" and "Active time series"
+I want to know if the limits were exceeded or no, and the percentage utilization
