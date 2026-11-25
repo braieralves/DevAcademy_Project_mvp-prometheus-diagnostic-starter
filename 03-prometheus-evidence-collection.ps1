@@ -30,7 +30,7 @@ function Write-Section {
 function Save-Text {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Content
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content
     )
     $Content | Out-File -FilePath $Path -Encoding utf8
 }
@@ -43,19 +43,28 @@ function Run-External {
 
     Write-Host "-> $Command"
     try {
+        $global:LASTEXITCODE = 0
+        $ErrorActionPreference = "Continue"
         $out = Invoke-Expression $Command 2>&1 | Out-String
+        $commandSucceeded = $?
+        $exitCode = $global:LASTEXITCODE
+        $ErrorActionPreference = "Stop"
+        if (-not $commandSucceeded -or $exitCode -ne 0) {
+            throw "Exit code: $exitCode`r`n$out"
+        }
         Save-Text -Path $OutputPath -Content $out
         return $true
     }
     catch {
         $msg = "COMMAND FAILED: $Command`r`nERROR: $($_.Exception.Message)"
         Save-Text -Path $OutputPath -Content $msg
+        Write-Warning $msg
         return $false
     }
 }
 
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-    throw "Azure CLI (az) not found. Install it and authenticate before running."
+    throw "Azure CLI (az) not found. Install it before running."
 }
 
 $hasKubectl = $null -ne (Get-Command kubectl -ErrorAction SilentlyContinue)
@@ -74,14 +83,12 @@ if ($ExpectedMetricName -ne "") {
 }
 
 Write-Section "Authenticating Azure session"
-$azureAuthenticated = Run-External -Command "az account show -o json" -OutputPath (Join-Path $outDir "00-account-show.json")
-if (-not $azureAuthenticated) {
-    Write-Host "No active Azure session detected. Starting az login..."
-    $loginOk = Run-External -Command "az login -o json" -OutputPath (Join-Path $outDir "00-az-login.json")
-    if (-not $loginOk) {
-        throw "Azure authentication failed. Check 00-az-login.json for details."
-    }
-    $azureAuthenticated = $true
+if ((Read-Host "Sign in to Azure for subscription $SubscriptionId using az login? [y/N]") -notmatch '^(y|yes)$') {
+    throw "Azure authentication cancelled by user."
+}
+az login --output none
+if ($LASTEXITCODE -ne 0) {
+    throw "Azure authentication failed (exit code $LASTEXITCODE)."
 }
 
 Write-Section "Selecting subscription"
@@ -89,9 +96,36 @@ $subscriptionSelected = Run-External -Command "az account set --subscription `"$
 if (-not $subscriptionSelected) {
     throw "Failed to select subscription $SubscriptionId. Check 01-account-set.txt for details."
 }
+$azureAuthenticated = Run-External -Command "az account show -o json" -OutputPath (Join-Path $outDir "00-account-show.json")
+if (-not $azureAuthenticated) {
+    throw "Unable to verify the selected Azure session. Check 00-account-show.json for details."
+}
+
+Write-Section "Connecting to AKS cluster"
+if ((Read-Host "Connect to AKS $AksResourceGroup/$AksClusterName and update the local kubeconfig? [y/N]") -notmatch '^(y|yes)$') {
+    throw "AKS authentication cancelled by user."
+}
+if (-not $hasKubectl) {
+    throw "kubectl not found. Install kubectl (and kubelogin for Microsoft Entra clusters), add the tools to PATH, and rerun. Azure CLI users can install them with: az aks install-cli"
+}
+$credentialsLoaded = Run-External -Command "az aks get-credentials -g `"$AksResourceGroup`" -n `"$AksClusterName`" --context `"$AksClusterName`" --overwrite-existing" -OutputPath (Join-Path $outDir "10-aks-get-credentials.txt")
+if (-not $credentialsLoaded) {
+    throw "Unable to retrieve AKS credentials. Check 10-aks-get-credentials.txt and your AKS access permissions."
+}
+Write-Host "Verifying cluster access. Complete any sign-in requested by the cluster credential plugin."
+Write-Host "Microsoft Entra clusters may require kubelogin on PATH."
+kubectl --context "$AksClusterName" get nodes --request-timeout=60s
+$aksConnected = $LASTEXITCODE -eq 0
+Save-Text -Path (Join-Path $outDir "10-aks-authentication.txt") -Content "Cluster access verified: $aksConnected"
+if (-not $aksConnected) {
+    throw "Cluster authentication/access failed. Check credentials, kubelogin, network access, and Kubernetes RBAC. Collection cannot continue without kubectl access."
+}
 
 Write-Section "Collecting AKS"
-Run-External -Command "az aks show -g `"$AksResourceGroup`" -n `"$AksClusterName`" -o json" -OutputPath (Join-Path $outDir "02-aks-show.json") | Out-Null
+$aksCollected = Run-External -Command "az aks show -g `"$AksResourceGroup`" -n `"$AksClusterName`" -o json" -OutputPath (Join-Path $outDir "02-aks-show.json")
+if (-not $aksCollected) {
+    throw "Unable to read AKS configuration. Check 02-aks-show.json for details."
+}
 $aksJson = Get-Content (Join-Path $outDir "02-aks-show.json") -Raw
 $aks = $aksJson | ConvertFrom-Json
 $aksId = [string]$aks.id
@@ -109,22 +143,18 @@ Run-External -Command "az monitor data-collection rule association list --resour
 Write-Section "Collecting AMPLS (subscription)"
 Run-External -Command "az monitor private-link-scope list --subscription `"$SubscriptionId`" -o json" -OutputPath (Join-Path $outDir "07-ampls-list.json") | Out-Null
 
-Write-Section "Connecting to AKS cluster"
-$aksConnected = Run-External -Command "az aks get-credentials -g `"$AksResourceGroup`" -n `"$AksClusterName`" --overwrite-existing" -OutputPath (Join-Path $outDir "10-aks-get-credentials.txt")
-
-if ($hasKubectl) {
-    Write-Section "Collecting data via kubectl"
-    if ($aksConnected) {
-        Run-External -Command "kubectl get nodes -o wide" -OutputPath (Join-Path $outDir "11-k8s-nodes.txt") | Out-Null
-        Run-External -Command "kubectl get pods -n kube-system -o json" -OutputPath (Join-Path $outDir "12-kube-system-pods.json") | Out-Null
-        Run-External -Command "kubectl get configmap -n kube-system" -OutputPath (Join-Path $outDir "13-kube-system-configmaps.txt") | Out-Null
-    }
-    else {
-        Save-Text -Path (Join-Path $outDir "11-k8s-status.txt") -Content "AKS connection failed. Kubernetes data collection was not executed."
-    }
+Write-Section "Collecting data via kubectl"
+$nodesCollected = Run-External -Command "kubectl --context `"$AksClusterName`" get nodes -o wide --request-timeout=60s" -OutputPath (Join-Path $outDir "11-k8s-nodes.txt")
+if (-not $nodesCollected) {
+    throw "Unable to query cluster nodes. Check 11-k8s-nodes.txt. Collection is incomplete."
 }
-else {
-    Save-Text -Path (Join-Path $outDir "10-kubectl-status.txt") -Content "kubectl not found. Kubernetes data collection was not executed."
+$podsCollected = Run-External -Command "kubectl --context `"$AksClusterName`" get pods -n kube-system -o json --request-timeout=60s" -OutputPath (Join-Path $outDir "12-kube-system-pods.json")
+if (-not $podsCollected) {
+    throw "Unable to query kube-system pods. Check 12-kube-system-pods.json and Kubernetes RBAC. Collection is incomplete."
+}
+$configMapsCollected = Run-External -Command "kubectl --context `"$AksClusterName`" get configmap -n kube-system --request-timeout=60s" -OutputPath (Join-Path $outDir "13-kube-system-configmaps.txt")
+if (-not $configMapsCollected) {
+    throw "Unable to query kube-system configmaps. Check 13-kube-system-configmaps.txt and Kubernetes RBAC. Collection is incomplete."
 }
 
 Write-Section "Generating initial summary"
@@ -160,7 +190,7 @@ if ($amaCount -gt 0 -and $amaReady -ge 0 -and $amaReady -lt $amaCount) {
     $hints += "- Some ama-metrics pods are not ready: investigate agent health."
 }
 if (-not $aksConnected) {
-    $hints += "- AKS connection failed during get-credentials: validate AKS access permissions and cluster state."
+    $hints += "- AKS access was not verified: check kubectl availability, credentials, kubelogin, network access, and Kubernetes RBAC."
 }
 if ($hints.Count -eq 0) {
     $hints += "- No obvious blocker in this initial collection. Proceed with target/scrape/query validation."
@@ -179,7 +209,7 @@ $summary = @"
 - Azure session authenticated: $azureAuthenticated
 - DCR associations on AKS: $dcrAssocCount
 - kubectl available: $hasKubectl
-- AKS connection (get-credentials): $aksConnected
+- AKS access verified (kubectl get nodes): $aksConnected
 - ama-metrics pods found: $amaCount
 - ama-metrics pods ready: $amaReady
 

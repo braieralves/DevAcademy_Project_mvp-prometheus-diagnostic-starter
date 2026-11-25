@@ -28,9 +28,11 @@ Standardize troubleshooting to reduce variation across engineers and accelerate 
 ## Prerequisites
 
 - PowerShell 5.1+ ou 7+
-- Azure CLI (`az`) authenticated
-- `kubectl` installed (optional, but recommended)
+- Azure CLI (`az`) installed; the script prompts for interactive sign-in
+- `kubectl` installed and on PATH (required)
+- `kubelogin` on PATH when required by a Microsoft Entra-enabled AKS cluster
 - Read permissions on AKS and Monitoring resources
+- Permission to retrieve AKS user credentials and Kubernetes read access for cluster evidence
 
 ## Quick run
 
@@ -43,6 +45,21 @@ powershell -ExecutionPolicy Bypass -File .\03-prometheus-evidence-collection.ps1
   -MonitorWorkspaceName "<azure-monitor-workspace-name>" `
   -ExpectedMetricName "<optional-metric-name>"
 ```
+
+### Authentication
+
+1. Confirm Azure sign-in when prompted, then complete standard `az login` authentication using an account with access to the requested subscription. The script does not force device-code authentication.
+2. The script selects that subscription as the active Azure CLI subscription.
+3. Confirm the cluster connection. This retrieves AKS user credentials and updates the local kubeconfig (including overwriting an existing entry). Every Kubernetes query explicitly selects the requested cluster context.
+4. Complete any sign-in requested by the cluster credential plugin. Before collecting resource evidence, the script verifies access with `kubectl get nodes` and a 60-second request timeout.
+
+Declining either confirmation stops the script. Failed Azure authentication, subscription selection, credential retrieval, or cluster access also stops it. Missing `kubectl` is a blocking error, not a skipped check; install it and, for Microsoft Entra clusters, `kubelogin` (for example, using `az aks install-cli`), ensure the tools are on PATH, and rerun.
+
+The script must successfully query nodes and kube-system pods and configmaps before generating a summary or reporting completion. Each Kubernetes request has a 60-second timeout. Authentication, RBAC, or network failures must be resolved before rerunning. Run from an interactive terminal; do not enter passwords or tokens into script parameters.
+
+### Authentication checks
+
+Run `powershell -NoProfile -File .\tests\authentication.tests.ps1` to exercise sign-in confirmation, cancellation, command failures, and verified cluster access with local test doubles. These checks do not contact Azure or modify kubeconfig.
 
 ## Output
 
