@@ -261,7 +261,7 @@ HTML_PAGE = """<!doctype html>
         executionLogEl.textContent = data.executionLog || "";
         executionLogEl.parentElement.scrollTop = executionLogEl.parentElement.scrollHeight;
 
-        if (data.status === "running") {
+        if (data.status === "queued" || data.status === "running") {
           setStatus("Running diagnostic. Streaming live output...");
           await sleep(1000);
           continue;
@@ -283,6 +283,12 @@ HTML_PAGE = """<!doctype html>
         setStatus("Fill all required fields.");
         return;
       }
+
+      if (!window.confirm(`Sign in to Azure for subscription ${payload.subscriptionId}, connect to AKS ${payload.aksResourceGroup}/${payload.aksClusterName}, and update the local kubeconfig (overwriting an existing entry)? Complete authentication in any sign-in window that opens.`)) {
+        setStatus("Authentication cancelled.");
+        return;
+      }
+      payload.confirmAuthentication = true;
 
       runBtn.disabled = true;
       setStatus("Starting diagnostic...");
@@ -376,10 +382,13 @@ def find_new_run_directory(before: set[str]) -> Path | None:
 def build_run_args(payload: dict) -> list[str]:
     args = [
         "powershell",
+        "-NoProfile",
+        "-NonInteractive",
         "-ExecutionPolicy",
         "Bypass",
         "-File",
         str(RUNBOOK_SCRIPT),
+        "-ConfirmAuthentication",
         "-SubscriptionId",
         payload["subscriptionId"],
         "-AksResourceGroup",
@@ -430,24 +439,32 @@ def run_job(job_id: str, payload: dict) -> None:
     args = build_run_args(payload)
     log_lines: list[str] = []
 
-    proc = subprocess.Popen(
-        args,
-        cwd=str(PROJECT_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    try:
+        proc = subprocess.Popen(
+            args,
+            cwd=str(PROJECT_ROOT),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as exc:
+        with RUN_JOBS_LOCK:
+            RUN_JOBS[job_id]["status"] = "failed"
+            RUN_JOBS[job_id]["error"] = f"Could not start PowerShell: {exc}"
+        return
 
     with RUN_JOBS_LOCK:
         RUN_JOBS[job_id]["status"] = "running"
 
     if proc.stdout is not None:
-        for line in proc.stdout:
-            log_lines.append(line)
-            with RUN_JOBS_LOCK:
-                RUN_JOBS[job_id]["executionLog"] = "".join(log_lines)
+        with proc.stdout:
+            for line in proc.stdout:
+                log_lines.append(line)
+                with RUN_JOBS_LOCK:
+                    RUN_JOBS[job_id]["executionLog"] = "".join(log_lines)
 
     return_code = proc.wait()
     execution_log = "".join(log_lines).strip()
@@ -555,6 +572,10 @@ class Handler(BaseHTTPRequestHandler):
         missing = [field for field in required if not str(payload.get(field, "")).strip()]
         if missing:
             json_response(self, HTTPStatus.BAD_REQUEST, {"error": f"Missing required fields: {', '.join(missing)}"})
+            return
+
+        if payload.get("confirmAuthentication") is not True:
+            json_response(self, HTTPStatus.BAD_REQUEST, {"error": "Confirm Azure sign-in and AKS kubeconfig update before starting."})
             return
 
         if not RUNBOOK_SCRIPT.exists():

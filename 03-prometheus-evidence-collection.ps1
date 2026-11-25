@@ -15,7 +15,8 @@ param(
     [string]$MonitorWorkspaceName,
 
     [string]$ExpectedMetricName = "",
-    [string]$OutputRoot = ".\output"
+    [string]$OutputRoot = ".\output",
+    [switch]$ConfirmAuthentication
 )
 
 Set-StrictMode -Version Latest
@@ -83,7 +84,7 @@ if ($ExpectedMetricName -ne "") {
 }
 
 Write-Section "Authenticating Azure session"
-if ((Read-Host "Sign in to Azure for subscription $SubscriptionId using az login? [y/N]") -notmatch '^(y|yes)$') {
+if (-not $ConfirmAuthentication -and (Read-Host "Sign in to Azure for subscription $SubscriptionId using az login? [y/N]") -notmatch '^(y|yes)$') {
     throw "Azure authentication cancelled by user."
 }
 az login --output none
@@ -102,7 +103,7 @@ if (-not $azureAuthenticated) {
 }
 
 Write-Section "Connecting to AKS cluster"
-if ((Read-Host "Connect to AKS $AksResourceGroup/$AksClusterName and update the local kubeconfig? [y/N]") -notmatch '^(y|yes)$') {
+if (-not $ConfirmAuthentication -and (Read-Host "Connect to AKS $AksResourceGroup/$AksClusterName and update the local kubeconfig? [y/N]") -notmatch '^(y|yes)$') {
     throw "AKS authentication cancelled by user."
 }
 if (-not $hasKubectl) {

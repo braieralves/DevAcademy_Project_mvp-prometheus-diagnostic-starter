@@ -82,7 +82,7 @@ function kubectl {
 }
 
 try {
-    foreach ($scenario in @("success", "decline-azure", "login-failure", "subscription-failure", "decline-cluster", "missing-kubectl", "credentials-failure", "cluster-failure", "nodes-failure", "pods-failure", "configmaps-failure")) {
+    foreach ($scenario in @("success", "gui-confirmation", "decline-azure", "login-failure", "subscription-failure", "decline-cluster", "missing-kubectl", "credentials-failure", "cluster-failure", "nodes-failure", "pods-failure", "configmaps-failure")) {
         $state.Scenario = $scenario
         $state.Calls.Clear()
         $state.Prompts.Clear()
@@ -91,11 +91,12 @@ try {
         try {
             & $collector -SubscriptionId "test-subscription" -AksResourceGroup "test-aks-rg" `
                 -AksClusterName "test-aks" -MonitorResourceGroup "test-monitor-rg" `
-                -MonitorWorkspaceName "test-workspace" -OutputRoot $outputRoot *> $null
+                -MonitorWorkspaceName "test-workspace" -OutputRoot $outputRoot `
+                -ConfirmAuthentication:($scenario -eq "gui-confirmation") *> $null
         }
         catch { $failure = $_ }
 
-        $shouldStop = $scenario -ne "success"
+        $shouldStop = $scenario -notin @("success", "gui-confirmation")
         Assert-True (($null -ne $failure) -eq $shouldStop) "Unexpected completion for $scenario : $failure"
         $summaryFile = @(Get-ChildItem -LiteralPath $outputRoot -Filter "report-summary.md" -Recurse)
         if ($shouldStop) {
@@ -139,6 +140,9 @@ try {
             Assert-True ($state.Calls.Contains("kubectl --context test-aks get nodes --request-timeout=60s")) "Cluster access was not verified."
             Assert-True ($state.Calls.Contains("kubectl --context test-aks get pods -n kube-system -o json --request-timeout=60s")) "Kubernetes evidence was not collected."
             Assert-True ($state.Calls.IndexOf("kubectl --context test-aks get nodes --request-timeout=60s") -lt $state.Calls.IndexOf("az aks show -g test-aks-rg -n test-aks -o json")) "Cluster access was not verified before evidence collection."
+            if ($scenario -eq "gui-confirmation") {
+                Assert-True ($state.Prompts.Count -eq 0) "GUI confirmation still required console input."
+            }
         }
         Write-Host "PASS: $scenario"
     }

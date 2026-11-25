@@ -59,9 +59,13 @@ Declining either confirmation stops the script. Failed Azure authentication, sub
 
 The script must successfully query nodes and kube-system pods and configmaps before generating a summary or reporting completion. Each Kubernetes request has a 60-second timeout. Authentication, RBAC, or network failures must be resolved before rerunning. Run from an interactive terminal; do not enter passwords or tokens into script parameters.
 
+The v2 web GUI asks for Azure sign-in and AKS connection consent in a browser confirmation dialog before starting. It passes `-ConfirmAuthentication` to the collector and disables PowerShell console input so hidden `Read-Host` prompts cannot stall the worker. This switch only confirms the two consent prompts; Azure sign-in and cluster-access verification still run. Complete authentication in the Azure sign-in window, not in the server terminal. Restart the GUI server after updating it. Unexpected PowerShell console prompts fail instead of waiting for terminal input.
+
 ### Authentication checks
 
 Run `powershell -NoProfile -File .\tests\authentication.tests.ps1` to exercise sign-in confirmation, cancellation, command failures, and verified cluster access with local test doubles. These checks do not contact Azure or modify kubeconfig.
+
+Run `python -B -m unittest discover -s tests -p "test_*.py"` for the v2 GUI confirmation and worker regression checks. These use a local PowerShell fixture, not Azure.
 
 ## Output
 
