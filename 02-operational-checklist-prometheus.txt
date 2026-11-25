@@ -25,26 +25,36 @@ Target and scraping
 [ ] Target status (UP/DOWN) evidenced
 [ ] Scrape endpoint accessible
 [ ] Scrape errors recorded
+[ ] Four documented scrape ConfigMaps present/absent/unknown, readable YAML collected
+[ ] Azure PodMonitor/ServiceMonitor CRDs and instances present/absent/unknown, readable YAML collected
 
 ama-metrics
 [ ] ama-metrics pods listed
 [ ] Ready status collected
 [ ] Restart count reviewed
 [ ] Logs with relevant errors (if any)
+[ ] prometheus-collector current and previous logs reviewed (last hour, up to 5000 lines)
+[ ] Collection config and diagnostic files from one running Linux collector reviewed
 
 DCR / DCE / associations
-[ ] DCR listed
-[ ] DCE listed (if applicable)
+[ ] Full DCR JSON resolved by association and workspace default resource IDs
+[ ] Full DCE JSON resolved by association, DCR and destination workspace resource IDs
 [ ] DCR association on AKS confirmed
 [ ] Scope and selectors compatible with target
 
 Connectivity and network
 [ ] DNS for relevant endpoints validated
-[ ] AMPLS/Private Link reviewed (if applicable)
+[ ] Cluster-linked DCE AMPLS association explicit: Associated / NotAssociated / Unknown
+[ ] Full AMPLS resource IDs and DCE/scoped-resource evidence recorded when associated
+[ ] Workspace public network access setting recorded (separate from ingestion connectivity)
 [ ] Network/firewall rules validated
 
 Ingestion/publication and query
 [ ] Evidence of normal/anomalous ingestion collected
+[ ] Actual workspace Events per minute and Active time series limits recorded
+[ ] Latest and peak utilization, timestamps, dimensions and sample counts reviewed
+[ ] Reached (>=100%) and exceeded (>100%) status reviewed for observed one-minute samples
+[ ] Collection failures or missing measurements recorded as Unknown, not zero/healthy
 [ ] Query/label matcher reviewed
 [ ] Query time window validated
 
