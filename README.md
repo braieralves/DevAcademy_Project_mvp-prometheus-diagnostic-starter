@@ -46,7 +46,6 @@ powershell -ExecutionPolicy Bypass -File .\03-prometheus-evidence-collection.ps1
 
 ## Output
 
-O script gera uma pasta `output\prom-missing-metrics-<timestamp>` com:
 The script generates an `output\prom-missing-metrics-<timestamp>` folder with:
 - JSON/TXT dumps of relevant configuration
 - snapshot of `ama-metrics` pods
