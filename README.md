@@ -1,5 +1,7 @@
 # MVP Starter — Missing Prometheus Metrics Diagnostic
 
+## TESTE PUSH
+
 Initial package (week 1) of the Capstone for the topic:
 **Accelerating Troubleshooting for Missing Prometheus Metrics in Azure Monitor**.
 
