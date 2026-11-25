@@ -1,0 +1,55 @@
+[CHECKLIST] Missing Prometheus Metrics - Azure Monitor
+
+Status:
+[ ] Pending
+[~] In progress
+[x] Completed
+
+Case
+[ ] Case / incident ID
+[ ] Subscription and tenant confirmed
+[ ] AKS cluster (RG + name) confirmed
+[ ] Azure Monitor Workspace (RG + name) confirmed
+[ ] Expected metric and exact query recorded
+[ ] Problem time window (UTC) recorded
+
+Initial validation
+[ ] Query reproduces the issue
+[ ] Has the metric existed before? (yes/no)
+[ ] Symptom scope: all metrics or some metrics
+[ ] Environment changed recently? (deployment/config/network)
+
+Target and scraping
+[ ] Expected target identified
+[ ] Target was discovered
+[ ] Target status (UP/DOWN) evidenced
+[ ] Scrape endpoint accessible
+[ ] Scrape errors recorded
+
+ama-metrics
+[ ] ama-metrics pods listed
+[ ] Ready status collected
+[ ] Restart count reviewed
+[ ] Logs with relevant errors (if any)
+
+DCR / DCE / associations
+[ ] DCR listed
+[ ] DCE listed (if applicable)
+[ ] DCR association on AKS confirmed
+[ ] Scope and selectors compatible with target
+
+Connectivity and network
+[ ] DNS for relevant endpoints validated
+[ ] AMPLS/Private Link reviewed (if applicable)
+[ ] Network/firewall rules validated
+
+Ingestion/publication and query
+[ ] Evidence of normal/anomalous ingestion collected
+[ ] Query/label matcher reviewed
+[ ] Query time window validated
+
+Closure
+[ ] Primary failure domain selected
+[ ] Key evidence attached
+[ ] Actionable next step defined
+[ ] Customer message ready
