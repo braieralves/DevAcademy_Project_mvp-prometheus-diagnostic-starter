@@ -14,6 +14,8 @@ Initial package (week 1) of the Capstone for the topic:
 3. `03-prometheus-evidence-collection.ps1`  
    Lightweight script to collect environment data (AKS, DCR/DCE, ama-metrics, DNS, and basic signals).
 
+4. [mvp_UI](./mvp_UI/) contains web GUI versions 1 and 2. Start either with `python .\mvp_UI\v1_runbook_web_gui.py` or `python .\mvp_UI\v2_runbook_web_gui.py`, then open `http://127.0.0.1:8750`. Run only one version at a time; both use the repository-root runbook and output directory.
+
 ## MVP objective
 
 Standardize troubleshooting to reduce variation across engineers and accelerate identification of the **failure domain**:

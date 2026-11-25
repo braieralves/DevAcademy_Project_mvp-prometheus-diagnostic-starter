@@ -9,20 +9,17 @@ import json
 import mimetypes
 import re
 import subprocess
-import threading
-import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNBOOK_SCRIPT = PROJECT_ROOT / "03-prometheus-evidence-collection.ps1"
+PROMPT_FILE = PROJECT_ROOT / "01-operational-prompt-prometheus.txt"
+CHECKLIST_FILE = PROJECT_ROOT / "02-operational-checklist-prometheus.txt"
 OUTPUT_ROOT = PROJECT_ROOT / "output"
 RUN_DIR_PATTERN = re.compile(r"^prom-missing-metrics-\d{8}-\d{6}$")
-
-RUN_JOBS: dict[str, dict] = {}
-RUN_JOBS_LOCK = threading.Lock()
 
 
 HTML_PAGE = """<!doctype html>
@@ -40,6 +37,7 @@ HTML_PAGE = """<!doctype html>
       --muted: #98a7c2;
       --accent: #4fb3ff;
       --good: #3ddc97;
+      --warn: #ffcc66;
       --bad: #ff6b6b;
       --border: #2b3a5c;
     }
@@ -110,14 +108,6 @@ HTML_PAGE = """<!doctype html>
       font-size: 0.9rem;
       color: #dfe8ff;
     }
-    .log-view {
-      max-height: 360px;
-      overflow: auto;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      background: #0d1630;
-      padding: 10px;
-    }
     .two-col {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -129,6 +119,7 @@ HTML_PAGE = """<!doctype html>
     table { width: 100%; border-collapse: collapse; }
     th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); }
     th { color: var(--muted); font-weight: 600; }
+    .muted { color: var(--muted); }
   </style>
 </head>
 <body>
@@ -170,20 +161,21 @@ HTML_PAGE = """<!doctype html>
     </div>
 
     <div id="results" style="display:none;">
-      <h2 class="section-title">Verbose (live output)</h2>
-      <div class="card">
-        <div class="log-view"><pre id="executionLog"></pre></div>
-      </div>
-
       <h2 class="section-title">Run Summary</h2>
       <div class="card">
         <div id="summaryHeader"></div>
         <div class="signals" id="signals"></div>
       </div>
 
-      <div style="margin-top:12px;" class="card">
-        <h3 style="margin-top:0;">report-summary.md</h3>
-        <pre id="reportSummary"></pre>
+      <div class="two-col" style="margin-top:12px;">
+        <div class="card">
+          <h3 style="margin-top:0;">report-summary.md</h3>
+          <pre id="reportSummary"></pre>
+        </div>
+        <div class="card">
+          <h3 style="margin-top:0;">Execution Log</h3>
+          <pre id="executionLog"></pre>
+        </div>
       </div>
 
       <h2 class="section-title">Artifacts</h2>
@@ -194,6 +186,18 @@ HTML_PAGE = """<!doctype html>
         </table>
       </div>
     </div>
+
+    <h2 class="section-title">Reference Materials</h2>
+    <div class="two-col">
+      <div class="card">
+        <h3 style="margin-top:0;">Operational Prompt</h3>
+        <pre id="promptRef" class="muted">Loading...</pre>
+      </div>
+      <div class="card">
+        <h3 style="margin-top:0;">Operational Checklist</h3>
+        <pre id="checklistRef" class="muted">Loading...</pre>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -201,9 +205,20 @@ HTML_PAGE = """<!doctype html>
     const runBtn = byId("runBtn");
     const statusEl = byId("status");
     const resultsEl = byId("results");
-    const executionLogEl = byId("executionLog");
 
     function setStatus(text) { statusEl.textContent = text; }
+
+    async function loadReferences() {
+      try {
+        const res = await fetch("/api/reference");
+        const data = await res.json();
+        byId("promptRef").textContent = data.prompt || "Not available";
+        byId("checklistRef").textContent = data.checklist || "Not available";
+      } catch (err) {
+        byId("promptRef").textContent = "Could not load references.";
+        byId("checklistRef").textContent = "Could not load references.";
+      }
+    }
 
     function collectInput() {
       return {
@@ -246,35 +261,6 @@ HTML_PAGE = """<!doctype html>
       });
     }
 
-    function sleep(ms) {
-      return new Promise((resolve) => setTimeout(resolve, ms));
-    }
-
-    async function pollJob(jobId) {
-      while (true) {
-        const res = await fetch(`/api/run-status?jobId=${encodeURIComponent(jobId)}`);
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.error || "Could not read run status.");
-        }
-
-        executionLogEl.textContent = data.executionLog || "";
-        executionLogEl.parentElement.scrollTop = executionLogEl.parentElement.scrollHeight;
-
-        if (data.status === "running") {
-          setStatus("Running diagnostic. Streaming live output...");
-          await sleep(1000);
-          continue;
-        }
-
-        if (data.status === "failed") {
-          throw new Error(data.error || "Run failed.");
-        }
-
-        return data.result;
-      }
-    }
-
     async function runDiagnostic() {
       const payload = collectInput();
       const required = ["subscriptionId", "aksResourceGroup", "aksClusterName", "monitorResourceGroup", "monitorWorkspaceName"];
@@ -285,34 +271,31 @@ HTML_PAGE = """<!doctype html>
       }
 
       runBtn.disabled = true;
-      setStatus("Starting diagnostic...");
-      resultsEl.style.display = "block";
-      byId("summaryHeader").innerHTML = "";
-      byId("reportSummary").textContent = "";
-      executionLogEl.textContent = "";
-      byId("artifactRows").innerHTML = "";
-      byId("signals").innerHTML = "";
+      setStatus("Running diagnostic. This may take a few minutes...");
+      resultsEl.style.display = "none";
 
       try {
-        const startRes = await fetch("/api/run-start", {
+        const res = await fetch("/api/run", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
-        const startData = await startRes.json();
-        if (!startRes.ok || !startData.success) {
-          throw new Error(startData.error || "Could not start diagnostic.");
+        const data = await res.json();
+        if (!res.ok || !data.success) {
+          throw new Error(data.error || "Diagnostic execution failed.");
         }
 
-        const data = await pollJob(startData.jobId);
         const summaryHeader = byId("summaryHeader");
         const cls = data.returnCode === 0 ? "ok" : "fail";
         const txt = data.returnCode === 0 ? "Run completed" : "Run finished with errors";
-        summaryHeader.innerHTML = `<span class="pill ${cls}">${txt}</span><span>${data.outputDir}</span>`;
+        summaryHeader.innerHTML = `<span class="pill ${cls}">${txt}</span><span class="muted">${data.outputDir}</span>`;
 
         byId("reportSummary").textContent = data.reportSummary || "No report-summary.md found.";
+        byId("executionLog").textContent = data.executionLog || "(empty)";
         renderSignals(data.signals || {});
         renderArtifacts(data.runName, data.artifacts || []);
+
+        resultsEl.style.display = "block";
         setStatus("Done.");
       } catch (err) {
         setStatus(err.message);
@@ -322,6 +305,7 @@ HTML_PAGE = """<!doctype html>
     }
 
     runBtn.addEventListener("click", runDiagnostic);
+    loadReferences();
   </script>
 </body>
 </html>
@@ -354,26 +338,16 @@ def parse_signals(report_summary: str) -> dict[str, str]:
     return result
 
 
-def list_run_directories() -> set[str]:
-    if not OUTPUT_ROOT.exists():
-        return set()
-    return {p.name for p in OUTPUT_ROOT.iterdir() if p.is_dir() and RUN_DIR_PATTERN.match(p.name)}
-
-
-def find_new_run_directory(before: set[str]) -> Path | None:
+def latest_run_directory() -> Path | None:
     if not OUTPUT_ROOT.exists():
         return None
-    candidates = [p for p in OUTPUT_ROOT.iterdir() if p.is_dir() and RUN_DIR_PATTERN.match(p.name) and p.name not in before]
-    if candidates:
-        return max(candidates, key=lambda p: p.stat().st_mtime)
-    # Fallback in case run folder already existed for any reason.
-    all_candidates = [p for p in OUTPUT_ROOT.iterdir() if p.is_dir() and RUN_DIR_PATTERN.match(p.name)]
-    if not all_candidates:
+    candidates = [p for p in OUTPUT_ROOT.iterdir() if p.is_dir() and RUN_DIR_PATTERN.match(p.name)]
+    if not candidates:
         return None
-    return max(all_candidates, key=lambda p: p.stat().st_mtime)
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def build_run_args(payload: dict) -> list[str]:
+def run_diagnostic(payload: dict) -> dict:
     args = [
         "powershell",
         "-ExecutionPolicy",
@@ -394,16 +368,22 @@ def build_run_args(payload: dict) -> list[str]:
     expected_metric = payload.get("expectedMetricName", "").strip()
     if expected_metric:
         args.extend(["-ExpectedMetricName", expected_metric])
-    return args
 
-
-def assemble_result(return_code: int, output_dir: Path | None, execution_log: str) -> dict:
+    proc = subprocess.run(
+        args,
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    output_dir = latest_run_directory()
     if output_dir is None:
         return {
             "success": False,
             "error": "Script finished, but no output folder was found under ./output.",
-            "returnCode": return_code,
-            "executionLog": execution_log,
+            "returnCode": proc.returncode,
+            "executionLog": (proc.stdout + "\n" + proc.stderr).strip(),
         }
 
     report_path = output_dir / "report-summary.md"
@@ -411,69 +391,23 @@ def assemble_result(return_code: int, output_dir: Path | None, execution_log: st
     artifacts = []
     for artifact in sorted(output_dir.iterdir()):
         if artifact.is_file():
-            artifacts.append({"name": artifact.name, "sizeKb": round(artifact.stat().st_size / 1024, 2)})
+            artifacts.append(
+                {
+                    "name": artifact.name,
+                    "sizeKb": round(artifact.stat().st_size / 1024, 2),
+                }
+            )
 
     return {
         "success": True,
-        "returnCode": return_code,
+        "returnCode": proc.returncode,
         "runName": output_dir.name,
         "outputDir": str(output_dir),
         "reportSummary": report_summary,
         "signals": parse_signals(report_summary),
         "artifacts": artifacts,
-        "executionLog": execution_log,
+        "executionLog": (proc.stdout + "\n" + proc.stderr).strip(),
     }
-
-
-def run_job(job_id: str, payload: dict) -> None:
-    before = list_run_directories()
-    args = build_run_args(payload)
-    log_lines: list[str] = []
-
-    proc = subprocess.Popen(
-        args,
-        cwd=str(PROJECT_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-
-    with RUN_JOBS_LOCK:
-        RUN_JOBS[job_id]["status"] = "running"
-
-    if proc.stdout is not None:
-        for line in proc.stdout:
-            log_lines.append(line)
-            with RUN_JOBS_LOCK:
-                RUN_JOBS[job_id]["executionLog"] = "".join(log_lines)
-
-    return_code = proc.wait()
-    execution_log = "".join(log_lines).strip()
-    output_dir = find_new_run_directory(before)
-    result = assemble_result(return_code, output_dir, execution_log)
-
-    with RUN_JOBS_LOCK:
-        RUN_JOBS[job_id]["executionLog"] = execution_log
-        RUN_JOBS[job_id]["result"] = result
-        RUN_JOBS[job_id]["status"] = "completed" if result.get("success") else "failed"
-        if result.get("success") is False:
-            RUN_JOBS[job_id]["error"] = result.get("error", "Run failed.")
-
-
-def start_job(payload: dict) -> str:
-    job_id = str(uuid.uuid4())
-    with RUN_JOBS_LOCK:
-        RUN_JOBS[job_id] = {
-            "status": "queued",
-            "executionLog": "",
-            "result": None,
-            "error": None,
-        }
-    thread = threading.Thread(target=run_job, args=(job_id, payload), daemon=True)
-    thread.start()
-    return job_id
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -488,19 +422,10 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        if parsed.path == "/api/run-status":
-            query = parse_qs(parsed.query)
-            job_id = (query.get("jobId") or [""])[0]
-            with RUN_JOBS_LOCK:
-                job = RUN_JOBS.get(job_id)
-            if not job:
-                json_response(self, HTTPStatus.NOT_FOUND, {"error": "Job not found."})
-                return
+        if parsed.path == "/api/reference":
             payload = {
-                "status": job["status"],
-                "executionLog": job.get("executionLog", ""),
-                "result": job.get("result"),
-                "error": job.get("error"),
+                "prompt": PROMPT_FILE.read_text(encoding="utf-8") if PROMPT_FILE.exists() else "",
+                "checklist": CHECKLIST_FILE.read_text(encoding="utf-8") if CHECKLIST_FILE.exists() else "",
             }
             json_response(self, HTTPStatus.OK, payload)
             return
@@ -533,7 +458,7 @@ class Handler(BaseHTTPRequestHandler):
         json_response(self, HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/api/run-start":
+        if self.path != "/api/run":
             json_response(self, HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
 
@@ -561,8 +486,11 @@ class Handler(BaseHTTPRequestHandler):
             json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"Runbook script not found: {RUNBOOK_SCRIPT.name}"})
             return
 
-        job_id = start_job(payload)
-        json_response(self, HTTPStatus.OK, {"success": True, "jobId": job_id})
+        result = run_diagnostic(payload)
+        if result.get("success"):
+            json_response(self, HTTPStatus.OK, result)
+            return
+        json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, result)
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003
         return
