@@ -1,9 +1,6 @@
 param(
-    [Parameter(Mandatory = $true)][string]$SubscriptionId,
-    [Parameter(Mandatory = $true)][string]$AksResourceGroup,
-    [Parameter(Mandatory = $true)][string]$AksClusterName,
-    [Parameter(Mandatory = $true)][string]$MonitorResourceGroup,
-    [Parameter(Mandatory = $true)][string]$MonitorWorkspaceName,
+    [Parameter(Mandatory = $true)][string]$AksResourceId,
+    [Parameter(Mandatory = $true)][string]$MonitorWorkspaceResourceId,
     [string]$ExpectedMetricName = "",
     [string]$OutputRoot = ".\output",
     [switch]$ConfirmAuthentication
@@ -47,14 +44,15 @@ function Add-CollectionIssue {
 }
 
 function Invoke-Tool {
-    param([string]$Tool, [string[]]$Arguments)
+    param([string]$Tool, [string[]]$Arguments, [string]$InputText = "")
     Write-Host "-> $Tool $($Arguments -join ' ')"
     $stderrPath = [System.IO.Path]::GetTempFileName()
     try {
         $isNative = (Get-Command $Tool -ErrorAction Stop).CommandType -eq "Application"
         $global:LASTEXITCODE = 0
         $ErrorActionPreference = "Continue"
-        $text = & $Tool @Arguments 2> $stderrPath | Out-String
+        if ($InputText) { $text = $InputText | & $Tool @Arguments 2> $stderrPath | Out-String }
+        else { $text = & $Tool @Arguments 2> $stderrPath | Out-String }
         $commandSucceeded = $?
         $exitCode = $global:LASTEXITCODE
         $ErrorActionPreference = "Stop"
@@ -120,8 +118,8 @@ function Get-ArmList {
 }
 
 function Save-KubernetesText {
-    param([string[]]$Arguments, [string]$Name)
-    $result = Invoke-Tool -Tool kubectl -Arguments ($kubeArgs + $Arguments)
+    param([string[]]$Arguments, [string]$Name, [string]$InputText = "")
+    $result = Invoke-Tool -Tool kubectl -Arguments ($kubeArgs + $Arguments) -InputText $InputText
     if ($result.Success) {
         $text = $result.Text
         if ([string]::IsNullOrWhiteSpace($text)) { $text = "Command succeeded; no content returned." }
@@ -153,13 +151,85 @@ function Get-MetricPoints {
     }
 }
 
+function Format-ChartNumber {
+    param([double]$Value, [string]$Unit)
+    if ($Unit -eq "%") { return $Value.ToString("0.0", [cultureinfo]::InvariantCulture) }
+    if ([math]::Abs($Value) -ge 1000) { return $Value.ToString("N0", [cultureinfo]::InvariantCulture) }
+    return $Value.ToString("0.##", [cultureinfo]::InvariantCulture)
+}
+
+# Plain-ASCII line chart so the evidence reads the same in any text viewer.
+function New-LineChart {
+    param([string]$Title, [object[]]$Points, [string]$Unit = "", [double]$FixedMin = [double]::NaN, [double]$FixedMax = [double]::NaN, [int]$Height = 10)
+    $ordered = @($Points | Sort-Object Timestamp)
+    if ($ordered.Count -eq 0) { return "$Title`r`n  No samples returned for this series. Unknown is not zero." }
+    $values = @($ordered | ForEach-Object { [double]$_.Value })
+    $min = if ([double]::IsNaN($FixedMin)) { ($values | Measure-Object -Minimum).Minimum } else { $FixedMin }
+    $max = if ([double]::IsNaN($FixedMax)) { ($values | Measure-Object -Maximum).Maximum } else { $FixedMax }
+    if ($max -le $min) {
+        if ($max -eq 0) { $max = 1 } else { $min = $max * 0.9; $max = $max * 1.1 }
+    }
+    $width = $values.Count
+    $grid = New-Object 'char[][]' $Height
+    for ($r = 0; $r -lt $Height; $r++) { $grid[$r] = (' ' * $width).ToCharArray() }
+    $previousRow = $null
+    for ($i = 0; $i -lt $width; $i++) {
+        $row = [int][math]::Round((($values[$i] - $min) / ($max - $min)) * ($Height - 1))
+        $row = [math]::Max(0, [math]::Min($Height - 1, $row))
+        if ($null -ne $previousRow) {
+            $low = [math]::Min($row, $previousRow) + 1
+            $high = [math]::Max($row, $previousRow) - 1
+            for ($r = $low; $r -le $high; $r++) { $grid[$r][$i] = '|' }
+        }
+        $grid[$row][$i] = '*'
+        $previousRow = $row
+    }
+    $labelWidth = 14
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add($Title)
+    for ($r = $Height - 1; $r -ge 0; $r--) {
+        $label = Format-ChartNumber ($min + ($max - $min) * $r / ($Height - 1)) $Unit
+        $lines.Add(("{0,$labelWidth} |{1}" -f $label, (-join $grid[$r])))
+    }
+    $lines.Add((' ' * $labelWidth) + ' +' + ('-' * $width))
+    $first = ([datetime]$ordered[0].Timestamp).ToUniversalTime().ToString("HH:mm")
+    $last = ([datetime]$ordered[-1].Timestamp).ToUniversalTime().ToString("HH:mm")
+    $span = "$first UTC"
+    if ($width -gt 14) { $span = $span.PadRight($width - 9) + "$last UTC" }
+    $lines.Add((' ' * ($labelWidth + 2)) + $span)
+    $lines.Add((' ' * ($labelWidth + 2)) + "$width one-minute samples; '*' = sample, '|' = change between samples")
+    return ($lines -join "`r`n")
+}
+
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) { throw "Azure CLI (az) not found. Install it before running." }
 $hasKubectl = $null -ne (Get-Command kubectl -ErrorAction SilentlyContinue)
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $outDir = Join-Path $OutputRoot "prom-missing-metrics-$timestamp"
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-$aksId = "/subscriptions/$SubscriptionId/resourceGroups/$AksResourceGroup/providers/Microsoft.ContainerService/managedClusters/$AksClusterName"
-$workspaceId = "/subscriptions/$SubscriptionId/resourceGroups/$MonitorResourceGroup/providers/Microsoft.Monitor/accounts/$MonitorWorkspaceName"
+function ConvertFrom-ResourceId {
+    param([string]$ResourceId, [string]$Provider, [string]$Type, [string]$Label)
+    $pattern = "^/subscriptions/(?<sub>[^/]+)/resourceGroups/(?<rg>[^/]+)/providers/$([regex]::Escape($Provider))/$([regex]::Escape($Type))/(?<name>[^/]+)$"
+    $match = [regex]::Match($ResourceId.Trim(), $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $match.Success) {
+        throw "Invalid $Label resource ID '$ResourceId'. Expected /subscriptions/<id>/resourceGroups/<rg>/providers/$Provider/$Type/<name>"
+    }
+    return [pscustomobject]@{
+        Id = $ResourceId.Trim()
+        SubscriptionId = $match.Groups["sub"].Value
+        ResourceGroup = $match.Groups["rg"].Value
+        Name = $match.Groups["name"].Value
+    }
+}
+
+$aks = ConvertFrom-ResourceId $AksResourceId "Microsoft.ContainerService" "managedClusters" "AKS"
+$monitorWorkspace = ConvertFrom-ResourceId $MonitorWorkspaceResourceId "Microsoft.Monitor" "accounts" "Azure Monitor workspace"
+$aksId = $aks.Id
+$workspaceId = $monitorWorkspace.Id
+$SubscriptionId = $aks.SubscriptionId
+$AksResourceGroup = $aks.ResourceGroup
+$AksClusterName = $aks.Name
+$MonitorResourceGroup = $monitorWorkspace.ResourceGroup
+$MonitorWorkspaceName = $monitorWorkspace.Name
 $kubeArgs = @("--context", $AksClusterName, "--request-timeout=60s")
 
 Write-Section "Authenticating Azure session"
@@ -186,7 +256,7 @@ if ($LASTEXITCODE -ne 0) { throw "Cluster authentication/access failed. Check cr
 
 Write-Section "Resolving linked DCRs and DCEs by resource ID"
 $associations = Get-ArmList "${aksId}/providers/Microsoft.Insights/dataCollectionRuleAssociations?api-version=2023-03-11"
-Save-Json "06-dcr-associations-aks.json" ([ordered]@{
+Save-Json "06-dcr-associations-aks.txt" ([ordered]@{
     status = $(if ($associations.Succeeded) { "Collected" } else { "Unknown" })
     message = "Associations on the requested AKS resource; DCRs and DCEs can be in other resource groups or subscriptions."
     associations = @($associations.Items)
@@ -242,7 +312,7 @@ foreach ($id in @($destinationWorkspaces.Keys)) {
     $id = [string](Get-Value $destinationWorkspace "properties.defaultIngestionSettings.dataCollectionEndpointResourceId")
     if ($id) { $dceIds[$id] = $true; $clusterDceIds[$id] = $true }
 }
-Save-Json "04-dcr-list.json" ([ordered]@{
+Save-Json "04-dcr-list.txt" ([ordered]@{
     status = $(if (-not $associations.Succeeded -or $null -eq $workspace -or $dcrs.Count -ne $dcrIds.Count) { "UnknownOrPartial" } elseif ($dcrs.Count) { "Collected" } else { "NotConfigured" })
     message = "Full DCR JSON resolved from AKS associations and workspace defaultIngestionSettings, not a resource-group list."
     clusterAssociatedRuleIds = $clusterDcrIds
@@ -271,7 +341,7 @@ foreach ($id in @($dceIds.Keys | Sort-Object)) {
         }
     }
 }
-Save-Json "05-dce-list.json" ([ordered]@{
+Save-Json "05-dce-list.txt" ([ordered]@{
     status = $(if (-not $linkDiscoveryComplete -or $null -eq $workspace -or $dces.Count -ne $dceIds.Count) { "UnknownOrPartial" } elseif ($dces.Count) { "Collected" } else { "NotConfigured" })
     message = "Full DCE JSON from direct AKS associations, linked DCRs and workspace default ingestion endpoints."
     clusterLinkedEndpointIds = @($clusterDceIds.Keys | Sort-Object)
@@ -279,14 +349,21 @@ Save-Json "05-dce-list.json" ([ordered]@{
 })
 $amplsStatus = if ($amplsLinks.Count) { "Associated" } elseif ($linkDiscoveryComplete) { "NotAssociated" } else { "Unknown" }
 $amplsIds = @($amplsLinks | ForEach-Object { $_.amplsResourceId } | Sort-Object -Unique)
-Save-Json "ampls-association.json" ([ordered]@{
-    status = $amplsStatus
-    verificationComplete = $linkDiscoveryComplete
-    clusterResourceId = $aksId
-    amplsResourceIds = $amplsIds
-    links = @($amplsLinks)
-    explanation = "Checks privateLinkScopedResources on DCEs linked through AKS associations, DCRs and their destination workspaces. Workspace defaults alone do not prove a cluster association. This is not a DNS/VNet connectivity test."
-})
+$amplsLinkLines = if ($amplsLinks.Count) {
+    @($amplsLinks | ForEach-Object { "  - Endpoint: $($_.endpointResourceId)`r`n    AMPLS: $($_.amplsResourceId)`r`n    Scoped resource: $($_.scopedResourceId)" })
+} else { @("  None found.") }
+Save-Text (Join-Path $outDir "ampls-association.txt") @"
+AMPLS association for the AKS cluster
+Cluster: $aksId
+Status: $amplsStatus
+Verification complete: $linkDiscoveryComplete
+AMPLS resource IDs: $(if ($amplsIds.Count) { $amplsIds -join ", " } else { "None" })
+
+Links found via data collection endpoints:
+$($amplsLinkLines -join "`r`n")
+
+Explanation: Checks privateLinkScopedResources on DCEs linked through AKS associations, DCRs and their destination workspaces. Workspace defaults alone do not prove a cluster association. This is not a DNS/VNet connectivity test.
+"@
 
 Write-Section "Collecting workspace ingestion limits and utilization (last 60 minutes UTC)"
 $metricsEnd = (Get-Date).ToUniversalTime()
@@ -296,9 +373,8 @@ $metricArgs = @("monitor", "metrics", "list", "--resource", $workspaceId, "--nam
     "--interval", "PT1M", "--output", "json", "--only-show-errors")
 $counts = Read-ToolJson az ($metricArgs + @("--metrics", "ActiveTimeSeries", "ActiveTimeSeriesLimit", "EventsPerMinuteIngested", "EventsPerMinuteIngestedLimit", "--aggregation", "Maximum"))
 $percentages = Read-ToolJson az ($metricArgs + @("--metrics", "ActiveTimeSeriesPercentUtilization", "EventsPerMinuteIngestedPercentUtilization", "--aggregation", "Average"))
-if ($null -ne $counts) { Save-Json "ingestion-counts-and-limits.json" $counts }
-if ($null -ne $percentages) { Save-Json "ingestion-utilization.json" $percentages }
 $ingestionRows = @()
+$ingestionSections = @()
 foreach ($definition in @(
     @{ Label = "Events per minute"; Base = "EventsPerMinuteIngested" },
     @{ Label = "Active time series"; Base = "ActiveTimeSeries" }
@@ -316,7 +392,7 @@ foreach ($definition in @(
         $peak = if ($utilization.Count) { ($utilization | Measure-Object Value -Maximum).Maximum } else { $null }
         $status = if ($null -eq $limit -or $null -eq $usage -or $null -eq $latest) { "Unknown" } else { "Measured" }
         if ($status -eq "Unknown") { Add-CollectionIssue "$($definition.Label) ($dimension): missing usage, limit or utilization samples. Cannot confirm ingestion status." }
-        $ingestionRows += [pscustomobject]@{
+        $row = [pscustomobject]@{
             metric = $definition.Label; dimension = $dimension; status = $status
             latestUsage = $(if ($usage) { $usage.Value } else { $null })
             usageTimestampUtc = $(if ($usage) { $usage.Timestamp } else { $null })
@@ -328,18 +404,61 @@ foreach ($definition in @(
             exceededInObservedSamples = $(if ($null -eq $peak) { "Unknown" } elseif ($peak -gt 100) { "Yes" } else { "No" })
             reachedLimitInObservedSamples = $(if ($null -eq $peak) { "Unknown" } elseif ($peak -ge 100) { "Yes" } else { "No" })
         }
+        $ingestionRows += $row
+        $percentMax = if ($null -ne $peak -and $peak -gt 100) { $peak } else { 100 }
+        $usageChart = New-LineChart "Usage - $($definition.Label) (maximum per minute)" @($usagePoints | Where-Object { $_.Dimension -eq $dimension })
+        $utilizationChart = New-LineChart "Utilization % of limit - $($definition.Label) (average per minute, scale 0-$percentMax%)" @($percentPoints | Where-Object { $_.Dimension -eq $dimension }) "%" 0 $percentMax
+        $ingestionSections += @"
+============================================================
+$($definition.Label) [$dimension]
+============================================================
+Status: $status
+Limit (latest): $(if ($limit) { "$($limit.Value) at $($limit.Timestamp)" } else { "Unknown" })
+Usage (latest): $(if ($usage) { "$($usage.Value) at $($usage.Timestamp)" } else { "Unknown" })
+Utilization % (latest): $(if ($latest) { "$($latest.Value) at $($latest.Timestamp)" } else { "Unknown" })
+Peak utilization %: $(if ($null -ne $peak) { $peak } else { "Unknown" }) ($($utilization.Count) samples)
+Limit exceeded (>100%) in observed samples: $($row.exceededInObservedSamples)
+Limit reached (>=100%) in observed samples: $($row.reachedLimitInObservedSamples)
+
+$usageChart
+
+$utilizationChart
+"@
     }
 }
-Save-Json "ingestion-status.json" ([ordered]@{
-    workspaceResourceId = $workspaceId
-    startUtc = $metricsStart.ToString("o"); endUtc = $metricsEnd.ToString("o"); interval = "PT1M"
-    interpretation = "Workspace-wide metrics without dimension filters; Azure rejects explicit filtering on the hidden StampColor dimension. Any returned series metadata is preserved. Limits/usage use Maximum; official utilization uses Average in each one-minute bucket. Peak is the highest observed one-minute utilization, not proof about unsampled periods or dropped data. Limits may change; each latest value has its own timestamp. No hardcoded quota defaults."
-    metrics = $ingestionRows
-})
-$ingestionText = $ingestionRows | Format-List * | Out-String -Width 240
-Save-Text (Join-Path $outDir "ingestion-status.txt") "UTC window: $($metricsStart.ToString('o')) to $($metricsEnd.ToString('o'))`r`n$ingestionText"
+$ingestionText = @"
+Azure Monitor workspace ingestion status (line charts)
+Workspace: $workspaceId
+UTC window: $($metricsStart.ToString('o')) to $($metricsEnd.ToString('o')) at 1-minute intervals
 
-Write-Section "Collecting ama-metrics pod status and prometheus-collector logs"
+How to read: workspace-wide metrics without dimension filters (Azure rejects filtering on the hidden StampColor dimension; any returned series metadata is kept as the dimension). Limits and usage use Maximum; utilization uses Average per one-minute bucket. Peak is the highest observed one-minute utilization, not proof about unsampled periods or dropped data. Limits can change, so each latest value has its own timestamp. Unknown is not zero.
+
+$($ingestionSections -join "`r`n`r`n")
+"@
+Save-Text (Join-Path $outDir "ingestion-status.txt") $ingestionText
+
+Write-Section "Collecting ama-metrics pod status, prometheus-collector logs and in-container error search"
+$issuePattern = '(?i)\b(error|warn(ing)?|fatal|exception|throttl\w*|fail\w*)\b'
+$containerSearchScript = @'
+echo "Container search report"
+echo "Host: $(hostname)   Date (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "Search terms (case-insensitive): error, warn, fail (failed/failure), fatal, exception, panic, denied, refused, timeout, throttle"
+PATTERN='error|warn|fail|fatal|exception|panic|denied|refused|timeout|throttl'
+FILES=$(find /MetricsExtensionConsoleDebugLog.log /opt/microsoft /etc/prometheus /tmp -maxdepth 4 -type f \( -name '*.log' -o -name '*.txt' -o -name 'mdsd.*' -o -name '*.err' -o -name '*.warn' -o -name '*.info' -o -name '*.qos' \) 2>/dev/null | grep -viE 'token|secret|cert|\.key|\.pem' | sort)
+echo
+echo "Log and message files inspected:"
+if [ -z "$FILES" ]; then echo "  none found"; fi
+for f in $FILES; do echo "  $f"; done
+for f in $FILES; do
+  n=$(grep -ciE "$PATTERN" "$f")
+  n=${n:-0}
+  echo
+  echo "--- $f: $n matching lines"
+  if [ "$n" -gt 0 ]; then grep -inE "$PATTERN" "$f" | tail -n 100 | cut -c1-600 | sed "s|^|MATCH $f:|"; fi
+done
+echo
+echo "Container search finished"
+'@ -replace "`r`n", "`n"
 $pods = Read-ToolJson kubectl ($kubeArgs + @("get", "pods", "-n", "kube-system", "-o", "json"))
 if ($null -eq $pods -or $null -eq $pods.PSObject.Properties["items"]) { throw "Unable to query kube-system pods. Collection is incomplete; see console errors." }
 $amaPods = @(Get-Value $pods "items" | Where-Object { $_.metadata.name -like "ama-metrics*" })
@@ -361,27 +480,43 @@ foreach ($pod in $amaPods) {
         }
         if ($container.name -ne "prometheus-collector") { continue }
         $collectorPods += $pod
-        $logArgs = @("logs", $podName, "-n", "kube-system", "-c", "prometheus-collector", "--since=1h", "--tail=5000", "--timestamps=true", "--pod-running-timeout=30s")
-        $log = Save-KubernetesText $logArgs "$podName-prometheus-collector.log"
+        $logArgs = @("logs", $podName, "-c", "prometheus-collector", "-n", "kube-system")
+        $log = Save-KubernetesText $logArgs "$podName-prometheus-collector.txt"
         if ($log.Success) {
-            foreach ($line in ($log.Text -split '\r?\n' | Where-Object { $_ -match '(?i)\b(error|warn(ing)?|fatal|exception|throttl\w*)\b' })) {
+            foreach ($line in ($log.Text -split '\r?\n' | Where-Object { $_ -match $issuePattern })) {
                 $errorLines.Add("${podName}: $line")
             }
         }
         if ((Get-Value $containerStatus "restartCount") -gt 0) {
-            $previousLog = Save-KubernetesText ($logArgs + @("--previous")) "$podName-prometheus-collector-previous.log"
+            $previousLog = Save-KubernetesText ($logArgs + @("--previous")) "$podName-prometheus-collector-previous.txt"
             if ($previousLog.Success) {
-                foreach ($line in ($previousLog.Text -split '\r?\n' | Where-Object { $_ -match '(?i)\b(error|warn(ing)?|fatal|exception|throttl\w*)\b' })) {
+                foreach ($line in ($previousLog.Text -split '\r?\n' | Where-Object { $_ -match $issuePattern })) {
                     $errorLines.Add("${podName} (previous): $line")
                 }
             }
+        }
+        $searchFile = "$podName-container-search.txt"
+        $canExec = (Get-Value $pod "status.phase") -eq "Running" -and $podName -notlike "ama-metrics-win*" -and
+            (Get-Value $pod "spec.os.name") -ne "windows" -and $null -ne (Get-Value $containerStatus "state.running")
+        if ($canExec) {
+            # Equivalent of: kubectl exec -it <pod> -c prometheus-collector -n kube-system -- /bin/bash, then running the search commands in that shell.
+            # Commands are sent on stdin; the first line strips CRs so Windows line endings cannot corrupt them.
+            $session = "eval ""`$(cat | tr -d '\r')"" #`n" + $containerSearchScript
+            $search = Save-KubernetesText @("exec", "-i", $podName, "-c", "prometheus-collector", "-n", "kube-system", "--", "/bin/bash") $searchFile $session
+            if ($search.Success) {
+                foreach ($line in ($search.Text -split '\r?\n' | Where-Object { $_ -match '^MATCH ' })) {
+                    $errorLines.Add("${podName} (inside container): $line")
+                }
+            }
+        }
+        else {
+            Save-Text (Join-Path $outDir $searchFile) "Not collected: the prometheus-collector container is not running on a Linux node, so it cannot be entered with /bin/bash."
         }
     }
 }
 $podStatusText = if ($statusRows.Count) { $statusRows | Format-Table -AutoSize -Wrap | Out-String -Width 260 } else { "No ama-metrics pods found in kube-system." }
 Save-Text (Join-Path $outDir "ama-metrics-status.txt") $podStatusText
-Save-Json "ama-metrics-status.json" ([ordered]@{ podCount = $amaPods.Count; containers = $statusRows })
-if ($errorLines.Count -eq 0) { $errorLines.Add("No matching error/warning lines in successfully retrieved logs. This is not proof of health; check collection issues and the bounded log window.") }
+if ($errorLines.Count -eq 0) { $errorLines.Add("No matching error/warning/failure lines in successfully retrieved logs. This is not proof of health; check collection issues.") }
 Save-Text (Join-Path $outDir "ama-metrics-errors-warnings.txt") ($errorLines -join "`r`n")
 
 Write-Section "Reading collection configuration and diagnostic files from one running Linux collector"
@@ -414,9 +549,10 @@ for file in /MetricsExtensionConsoleDebugLog.log /opt/microsoft/linuxmonagent/md
   fi
 done
 '@
+    $snapshotScript = $snapshotScript -replace "`r`n", "`n"
     $snapshot = Save-KubernetesText @("exec", $snapshotPod.metadata.name, "-n", "kube-system", "-c", "prometheus-collector", "--", "sh", "-c", $snapshotScript) "collector-files.txt"
     if ($snapshot.Success) {
-        $matches = @($snapshot.Text -split '\r?\n' | Where-Object { $_ -match '(?i)\b(error|warn(ing)?|fatal|exception|throttl\w*)\b' })
+        $matches = @($snapshot.Text -split '\r?\n' | Where-Object { $_ -match $issuePattern })
         Save-Text (Join-Path $outDir "collector-file-errors-warnings.txt") $(if ($matches.Count) { $matches -join "`r`n" } else { "No matching error/warning lines in the collected file excerpts." })
     }
 }
@@ -437,8 +573,8 @@ foreach ($name in @("ama-metrics-settings-configmap", "ama-metrics-prometheus-co
         $configStatus += "${name}: Not present (optional customization; defaults apply)."
     }
     else {
-        $configStatus += "${name}: Present - $name.yaml"
-        Save-Text (Join-Path $outDir "$name.yaml") $result.Text
+        $configStatus += "${name}: Present - $name.txt"
+        Save-Text (Join-Path $outDir "$name.txt") $result.Text
     }
 }
 Save-Text (Join-Path $outDir "configmaps-status.txt") ($configStatus -join "`r`n")
@@ -456,7 +592,7 @@ foreach ($resource in @("podmonitors.azmonitoring.coreos.com", "servicemonitors.
         $monitorStatus += "${resource}: CRD not installed; no Azure-managed instances can exist."
         continue
     }
-    Save-Text (Join-Path $outDir "$resource-crd.yaml") $crd.Text
+    Save-Text (Join-Path $outDir "$resource-crd.txt") $crd.Text
     $monitorList = Read-ToolJson kubectl ($kubeArgs + @("get", $resource, "--all-namespaces", "-o", "json"))
     if ($null -eq $monitorList -or $null -eq $monitorList.PSObject.Properties["items"]) {
         if ($null -ne $monitorList) { Add-CollectionIssue "${resource}: invalid list response; items array missing." }
@@ -468,8 +604,8 @@ foreach ($resource in @("podmonitors.azmonitoring.coreos.com", "servicemonitors.
         $monitorStatus += "${resource}: CRD installed; no custom-resource instances found in any namespace."
         continue
     }
-    $instances = Save-KubernetesText @("get", $resource, "--all-namespaces", "-o", "yaml") "$resource.yaml"
-    $monitorStatus += "${resource}: CRD installed; $monitorCount instances listed. Content in $resource.yaml. YAML query succeeded: $($instances.Success)."
+    $instances = Save-KubernetesText @("get", $resource, "--all-namespaces", "-o", "yaml") "$resource.txt"
+    $monitorStatus += "${resource}: CRD installed; $monitorCount instances listed. Content in $resource.txt. YAML query succeeded: $($instances.Success)."
 }
 Save-Text (Join-Path $outDir "monitors-status.txt") ($monitorStatus -join "`r`n")
 
@@ -489,8 +625,8 @@ $summary = @"
 
 ## Context
 - Subscription: $SubscriptionId
-- AKS: $AksResourceGroup / $AksClusterName
-- Monitor Workspace: $MonitorResourceGroup / $MonitorWorkspaceName
+- AKS: $aksId
+- Monitor Workspace: $workspaceId
 - Expected metric: $(if ($ExpectedMetricName) { $ExpectedMetricName } else { "not provided" })
 
 ## Initial signals
@@ -508,20 +644,47 @@ $summary = @"
 ## Ingestion status (workspace-wide, last 60 minutes UTC)
 $(($ingestionRows | ForEach-Object { "- $($_.metric) [$($_.dimension)]: limit=$($_.latestLimit); usage=$($_.latestUsage); utilization=$($_.latestUtilizationPercent)%; peak=$($_.peakUtilizationPercent)%; exceeded=$($_.exceededInObservedSamples); reached=$($_.reachedLimitInObservedSamples); status=$($_.status)" }) -join "`r`n")
 
-See ingestion-status.txt and ingestion-status.json for timestamps, sample counts and aggregation. Unknown is not zero. No means no exceedance observed in available one-minute samples, not proof about missing periods.
+Line charts (also in ingestion-status.txt):
+
+$($ingestionSections -join "`r`n`r`n")
+
+Unknown is not zero. No means no exceedance observed in available one-minute samples, not proof about missing periods.
 
 ## Findings and next steps
 $(($hints | ForEach-Object { "- $_" }) -join "`r`n")
 
-## Evidence
-- 04-dcr-list.json / 05-dce-list.json: full linked resource content, with explicit discovery status.
-- ampls-association.json: cluster-linked DCE evidence and full AMPLS resource IDs.
-- workspace-network.txt: public access setting without a workspace JSON dump.
-- ama-metrics-status.txt and prometheus-collector log files: container readiness, restarts, errors and warnings.
+## Evidence (all plain text; everything is also combined in evidence-report.txt)
+- 04-dcr-list.txt / 05-dce-list.txt / 06-dcr-associations-aks.txt: full linked resource responses, with explicit discovery status.
+- ampls-association.txt: cluster-linked DCE evidence and full AMPLS resource IDs.
+- workspace-network.txt: public access setting without a workspace dump.
+- ingestion-status.txt: workspace ingestion limits and usage as line charts.
+- ama-metrics-status.txt: container readiness and restarts.
+- <pod>-prometheus-collector.txt: output of kubectl logs <pod> -c prometheus-collector -n kube-system.
+- <pod>-container-search.txt: error/warning/fail search run inside the container through kubectl exec ... -- /bin/bash.
+- ama-metrics-errors-warnings.txt: issue lines from the logs and the in-container search.
 - collector-files.txt: read-only configuration/diagnostic excerpts from one running Linux collector.
-- configmaps-status.txt and monitors-status.txt: present, absent, or unknown plus readable YAML where available.
+- configmaps-status.txt and monitors-status.txt: present, absent, or unknown plus readable content where available.
 - collection-issues.txt: command failures and missing evidence.
 "@
 Save-Text (Join-Path $outDir "report-summary.md") $summary
+
+$reportFiles = @(Get-ChildItem -LiteralPath $outDir -File | Where-Object { $_.Name -ne "evidence-report.txt" } |
+    Sort-Object @{ Expression = { if ($_.Name -eq "report-summary.md") { 0 } else { 1 } } }, Name)
+$evidenceReport = [System.Text.StringBuilder]::new()
+[void]$evidenceReport.AppendLine("PROMETHEUS DIAGNOSTIC - COMPLETE EVIDENCE REPORT")
+[void]$evidenceReport.AppendLine("Generated (UTC): $((Get-Date).ToUniversalTime().ToString('o'))")
+[void]$evidenceReport.AppendLine("AKS: $aksId")
+[void]$evidenceReport.AppendLine("Monitor Workspace: $workspaceId")
+[void]$evidenceReport.AppendLine("")
+[void]$evidenceReport.AppendLine("CONTENTS")
+foreach ($file in $reportFiles) { [void]$evidenceReport.AppendLine("  - $($file.Name)") }
+foreach ($file in $reportFiles) {
+    [void]$evidenceReport.AppendLine("")
+    [void]$evidenceReport.AppendLine(("=" * 100))
+    [void]$evidenceReport.AppendLine("FILE: $($file.Name)")
+    [void]$evidenceReport.AppendLine(("=" * 100))
+    [void]$evidenceReport.AppendLine((Get-Content -LiteralPath $file.FullName -Raw))
+}
+Save-Text (Join-Path $outDir "evidence-report.txt") $evidenceReport.ToString()
 Write-Host "`nCollection $completion. Artifacts in: $outDir"
 if ($collectionIssues.Count) { throw "Collection is incomplete ($($collectionIssues.Count) issues). See report-summary.md and collection-issues.txt." }

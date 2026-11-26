@@ -19,6 +19,13 @@ function Assert-True {
     if (-not $Condition) { throw $Message }
 }
 
+function Get-IngestionBlock {
+    param([string]$Text, [string]$Title)
+    $pattern = "(?s)={40,}\r?\n" + [regex]::Escape($Title) + "\r?\n={40,}\r?\n(?<body>.*?)(?=\r?\n={40,}\r?\n|\z)"
+    $match = [regex]::Match($Text, $pattern)
+    if ($match.Success) { $match.Groups["body"].Value } else { "" }
+}
+
 function Read-Host {
     param([string]$Prompt)
     $state.Prompts.Add($Prompt)
@@ -179,6 +186,11 @@ function kubectl {
         "2026-11-25T18:00:00Z WARNING throttled"
         "2026-11-25T18:00:01Z ERROR fixture scrape failure"
     }
+    elseif ($command -like "* exec -i ama-metrics-test *") {
+        "Container search report"
+        "### Searching /MetricsExtensionConsoleDebugLog.log"
+        "MATCH /MetricsExtensionConsoleDebugLog.log:7:ERROR fixture remote-write failure"
+    }
     elseif ($command -like "* exec ama-metrics-test *") {
         "CONFIG ROOT: /opt/microsoft/otelcollector"
         "collector-config.yml"
@@ -219,9 +231,7 @@ try {
         $outputRoot = Join-Path $testRoot $scenario
         $failure = $null
         try {
-            & $collector -SubscriptionId "test-subscription" -AksResourceGroup "test-aks-rg" `
-                -AksClusterName "test-aks" -MonitorResourceGroup "test-monitor-rg" `
-                -MonitorWorkspaceName "test-workspace" -OutputRoot $outputRoot `
+            & $collector -AksResourceId $clusterId -MonitorWorkspaceResourceId $workspaceId -OutputRoot $outputRoot `
                 -ConfirmAuthentication:($scenario -eq "gui-confirmation") *> $null
         }
         catch { $failure = $_ }
@@ -252,67 +262,74 @@ try {
         }
         else {
             $summary = Get-Content -LiteralPath $summaryFile -Raw
-            $ampls = Get-Content (Join-Path $run.FullName "ampls-association.json") -Raw | ConvertFrom-Json
-            $dcr = Get-Content (Join-Path $run.FullName "04-dcr-list.json") -Raw | ConvertFrom-Json
-            $dce = Get-Content (Join-Path $run.FullName "05-dce-list.json") -Raw | ConvertFrom-Json
-            $ingestion = Get-Content (Join-Path $run.FullName "ingestion-status.json") -Raw | ConvertFrom-Json
+            $amplsText = Get-Content (Join-Path $run.FullName "ampls-association.txt") -Raw
+            $dcr = Get-Content (Join-Path $run.FullName "04-dcr-list.txt") -Raw | ConvertFrom-Json
+            $dce = Get-Content (Join-Path $run.FullName "05-dce-list.txt") -Raw | ConvertFrom-Json
+            $ingestionText = Get-Content (Join-Path $run.FullName "ingestion-status.txt") -Raw
+            Assert-True (-not (@($files | Where-Object { $_.Extension -in @(".json", ".yaml", ".log") }).Count)) "Non-text evidence file persisted."
+            Assert-True (Test-Path (Join-Path $run.FullName "evidence-report.txt")) "Missing combined evidence report."
+            Assert-True ((Get-Content (Join-Path $run.FullName "evidence-report.txt") -Raw).Contains("FILE: ingestion-status.txt")) "Combined report is missing evidence files."
             Assert-True ($summary.Contains("Workspace public network access: Disabled")) "Missing workspace public access summary."
             Assert-True (-not ($state.Calls -match "data-collection rule list|private-link-scope list| get configmap -n")) "Used broad resource-group/configmap collection."
             if ($shouldStop) {
                 Assert-True ($summary.Contains("Collection status: Incomplete")) "Failure was reported as complete."
             }
             if ($scenario -eq "workspace-metrics") {
-                Assert-True ($ingestion.metrics.Count -eq 2) "Workspace metric series were lost or duplicated."
-                foreach ($row in $ingestion.metrics) {
-                    Assert-True ($row.dimension -eq "workspace" -and $row.status -eq "Measured") "Unfiltered workspace metrics were not reported."
-                    Assert-True ($row.latestLimit -eq 2000000 -and $row.utilizationSamples -eq 2) "Lost quota or samples from unfiltered workspace metrics."
-                }
+                Assert-True ($ingestionText.Contains("Events per minute [workspace]") -and $ingestionText.Contains("Active time series [workspace]")) "Workspace metric series were lost."
+                Assert-True (([regex]::Matches($ingestionText, "Status: Measured")).Count -eq 2) "Unfiltered workspace metrics were not reported."
+                Assert-True (([regex]::Matches($ingestionText, "Limit \(latest\): 2000000")).Count -eq 2 -and $ingestionText -like "*(2 samples)*") "Lost quota or samples from unfiltered workspace metrics."
             }
             if ($scenario -in @("success", "gui-confirmation")) {
                 Assert-True ($dcr.resources.Count -eq 2 -and $dce.resources.Count -eq 2) "Did not resolve cross-group associations and workspace defaults."
                 Assert-True (@($dcr.resources | Where-Object { $_.id -eq $dcrId }).Count -eq 1) "Missing linked DCR JSON."
                 Assert-True (@($dce.resources | Where-Object { $_.id -eq $fixtureDceId }).Count -eq 1) "Missing linked DCE JSON."
-                Assert-True ($ampls.status -eq "Associated" -and $ampls.amplsResourceIds[0] -eq $amplsId) "Wrong AMPLS ARM ID."
-                $events = $ingestion.metrics | Where-Object { $_.metric -eq "Events per minute" -and $_.dimension -eq "StampColor=blue" }
-                $series = $ingestion.metrics | Where-Object { $_.metric -eq "Active time series" -and $_.dimension -eq "StampColor=blue" }
-                $zero = $ingestion.metrics | Where-Object { $_.metric -eq "Events per minute" -and $_.dimension -eq "StampColor=green" }
-                Assert-True ($events.latestLimit -eq 2000000 -and $events.latestUsage -eq 2020000 -and $events.latestUtilizationPercent -eq 101 -and $events.peakUtilizationPercent -eq 115 -and $events.exceededInObservedSamples -eq "Yes") "Incorrect current limit, usage, peak or exceedance."
-                Assert-True ($series.latestUtilizationPercent -eq 100 -and $series.exceededInObservedSamples -eq "No" -and $series.reachedLimitInObservedSamples -eq "Yes") "Incorrect 100 percent boundary."
-                Assert-True ($zero.latestUtilizationPercent -eq 0 -and $zero.latestLimit -eq 3000000 -and $zero.status -eq "Measured") "Lost zero metric values or merged dimensions."
-                Assert-True ($events.utilizationTimestampUtc -eq "2026-11-25T18:30:00Z") "Null sample replaced last real measurement."
-                $status = Get-Content (Join-Path $run.FullName "ama-metrics-status.json") -Raw | ConvertFrom-Json
-                Assert-True ($status.podCount -eq 2 -and $status.containers.Count -eq 2) "Status includes unrelated pods or drops unready containers."
-                Assert-True ($status.containers[0].PreviousState -like "*OOMKilled*") "Lost prior termination reason."
-                Assert-True (Test-Path (Join-Path $run.FullName "ama-metrics-test-prometheus-collector-previous.log")) "Missing prior collector logs."
+                Assert-True ($amplsText -like "*Status: Associated*" -and $amplsText.Contains($amplsId)) "Wrong AMPLS ARM ID."
+                $eventsBlock = Get-IngestionBlock $ingestionText "Events per minute [StampColor=blue]"
+                $seriesBlock = Get-IngestionBlock $ingestionText "Active time series [StampColor=blue]"
+                Assert-True ($ingestionText.Contains("Events per minute [StampColor=green]")) "Lost a dimension."
+                Assert-True ($eventsBlock -match "Limit \(latest\): 2000000" -and $eventsBlock -match "Usage \(latest\): 2020000" -and $eventsBlock -match "Utilization % \(latest\): 101 " -and $eventsBlock -match "Peak utilization %: 115" -and $eventsBlock -match "exceeded \(>100%\) in observed samples: Yes") "Incorrect current limit, usage, peak or exceedance."
+                Assert-True ($seriesBlock -match "Utilization % \(latest\): 100 " -and $seriesBlock -match "exceeded \(>100%\) in observed samples: No" -and $seriesBlock -match "reached \(>=100%\) in observed samples: Yes") "Incorrect 100 percent boundary."
+                Assert-True ($ingestionText -match "Limit \(latest\): 3000000" -and $ingestionText -match "Utilization % \(latest\): 0 ") "Lost zero metric values or merged dimensions."
+                Assert-True ($eventsBlock -match "Utilization % \(latest\): 101 at 2026-11-25T18:30:00Z") "Null sample replaced last real measurement."
+                Assert-True ($eventsBlock -match "\*" -and $eventsBlock -match "one-minute samples" -and $eventsBlock -match "18:30 UTC|18:29 UTC") "Ingestion section is not a line chart."
+                $status = Get-Content (Join-Path $run.FullName "ama-metrics-status.txt") -Raw
+                Assert-True ($status -like "*ama-metrics-test*" -and $status -notlike "*unrelated-pod*" -and $status -like "*ama-metrics-ksm-test*") "Status includes unrelated pods or drops unready containers."
+                Assert-True ($status -like "*OOMKilled*") "Lost prior termination reason."
+                Assert-True (Test-Path (Join-Path $run.FullName "ama-metrics-test-prometheus-collector-previous.txt")) "Missing prior collector logs."
+                Assert-True ($state.Calls -contains "kubectl --context test-aks --request-timeout=60s logs ama-metrics-test -c prometheus-collector -n kube-system") "Logs were not collected with the plain kubectl logs format."
+                Assert-True (@($state.Calls | Where-Object { $_ -like "*logs ama-metrics-test*" -and ($_ -match "--since|--tail|--timestamps") }).Count -eq 0) "Log command has extra options."
+                Assert-True (@($state.Calls | Where-Object { $_ -like "*exec -i ama-metrics-test -c prometheus-collector -n kube-system -- /bin/bash" }).Count -eq 1) "Did not enter the container with /bin/bash."
+                Assert-True ((Get-Content (Join-Path $run.FullName "ama-metrics-test-container-search.txt") -Raw) -like "*ERROR fixture remote-write failure*") "Missing in-container search output."
                 Assert-True ((Get-Content (Join-Path $run.FullName "collector-files.txt") -Raw) -like "*collector-config.yml*") "Missing in-container file collection."
-                Assert-True ((Get-Content (Join-Path $run.FullName "ama-metrics-errors-warnings.txt") -Raw) -like "*WARNING throttled*") "Missing warning/error excerpts."
-                Assert-True (Test-Path (Join-Path $run.FullName "ama-metrics-settings-configmap.yaml")) "Missing readable ConfigMap content."
+                $issues = Get-Content (Join-Path $run.FullName "ama-metrics-errors-warnings.txt") -Raw
+                Assert-True ($issues -like "*WARNING throttled*" -and $issues -like "*(inside container)*fixture remote-write failure*") "Missing warning/error excerpts."
+                Assert-True (Test-Path (Join-Path $run.FullName "ama-metrics-settings-configmap.txt")) "Missing readable ConfigMap content."
                 Assert-True ((Get-Content (Join-Path $run.FullName "configmaps-status.txt") -Raw) -like "*ama-metrics-prometheus-config: Not present*") "Missing optional ConfigMap absence status."
-                Assert-True (Test-Path (Join-Path $run.FullName "podmonitors.azmonitoring.coreos.com.yaml")) "Missing monitor content."
+                Assert-True (Test-Path (Join-Path $run.FullName "podmonitors.azmonitoring.coreos.com.txt")) "Missing monitor content."
                 if ($scenario -eq "gui-confirmation") { Assert-True ($state.Prompts.Count -eq 0) "GUI still needs console confirmation." }
             }
             if ($scenario -eq "absent") {
                 Assert-True ($dcr.status -eq "NotConfigured" -and $dce.status -eq "NotConfigured") "Absent resources not explicit."
-                Assert-True ($ampls.status -eq "NotAssociated") "Absent AMPLS not explicit."
+                Assert-True ($amplsText -like "*Status: NotAssociated*") "Absent AMPLS not explicit."
                 Assert-True ((Get-Content (Join-Path $run.FullName "monitors-status.txt") -Raw) -like "*CRD not installed*") "CRD absence not explicit."
                 Assert-True (-not ($state.Calls -match " --all-namespaces")) "Queried uninstalled CRDs."
             }
             if ($scenario -eq "no-monitors") {
                 Assert-True ((Get-Content (Join-Path $run.FullName "monitors-status.txt") -Raw) -like "*no custom-resource instances found*") "Empty monitor lists not explicitly reported."
-                Assert-True (-not (Test-Path (Join-Path $run.FullName "podmonitors.azmonitoring.coreos.com.yaml"))) "Saved an empty monitor-content file."
+                Assert-True (-not (Test-Path (Join-Path $run.FullName "podmonitors.azmonitoring.coreos.com.txt"))) "Saved an empty monitor-content file."
             }
-            if ($scenario -eq "not-associated") { Assert-True ($ampls.status -eq "NotAssociated") "Empty links not reported as not associated." }
+            if ($scenario -eq "not-associated") { Assert-True ($amplsText -like "*Status: NotAssociated*") "Empty links not reported as not associated." }
             if ($scenario -eq "default-only-ampls") {
-                Assert-True ($ampls.status -eq "Associated") "Destination workspace ingestion DCE was not checked."
+                Assert-True ($amplsText -like "*Status: Associated*") "Destination workspace ingestion DCE was not checked."
             }
             if ($scenario -eq "workspace-only-ampls") {
-                Assert-True ($ampls.status -eq "NotAssociated" -and $ampls.amplsResourceIds.Count -eq 0) "Unrelated workspace defaults were treated as a cluster association."
+                Assert-True ($amplsText -like "*Status: NotAssociated*" -and $amplsText -like "*AMPLS resource IDs: None*") "Unrelated workspace defaults were treated as a cluster association."
             }
             if ($scenario -in @("association-denied", "dcr-denied", "dce-denied")) {
-                Assert-True ($ampls.status -ne "NotAssociated" -and -not $ampls.verificationComplete) "Access failure reported as no AMPLS or as fully verified."
+                Assert-True ($amplsText -notlike "*Status: NotAssociated*" -and $amplsText -like "*Verification complete: False*") "Access failure reported as no AMPLS or as fully verified."
             }
             if ($scenario -in @("no-metrics", "metrics-denied")) {
-                Assert-True (@($ingestion.metrics | Where-Object { $_.status -ne "Unknown" -or $null -ne $_.latestUtilizationPercent -or $_.exceededInObservedSamples -ne "Unknown" }).Count -eq 0) "Missing metrics treated as zero/healthy."
+                Assert-True (([regex]::Matches($ingestionText, "Status: Unknown")).Count -eq 2 -and $ingestionText -notlike "*Status: Measured*" -and $ingestionText -like "*No samples returned*") "Missing metrics treated as zero/healthy."
             }
         }
         Write-Host "PASS: $scenario"

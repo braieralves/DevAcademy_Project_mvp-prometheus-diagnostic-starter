@@ -139,24 +139,12 @@ HTML_PAGE = """<!doctype html>
     <div class="card">
       <div class="grid">
         <div>
-          <label for="subscriptionId">Subscription ID</label>
-          <input id="subscriptionId" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
+          <label for="aksResourceId">AKS Resource ID</label>
+          <input id="aksResourceId" placeholder="/subscriptions/&lt;sub-id&gt;/resourceGroups/&lt;rg&gt;/providers/Microsoft.ContainerService/managedClusters/&lt;aks-name&gt;" />
         </div>
         <div>
-          <label for="aksResourceGroup">AKS Resource Group</label>
-          <input id="aksResourceGroup" placeholder="rg-aks-prod" />
-        </div>
-        <div>
-          <label for="aksClusterName">AKS Cluster Name</label>
-          <input id="aksClusterName" placeholder="aks-prod-01" />
-        </div>
-        <div>
-          <label for="monitorResourceGroup">Monitor Resource Group</label>
-          <input id="monitorResourceGroup" placeholder="rg-monitor-prod" />
-        </div>
-        <div>
-          <label for="monitorWorkspaceName">Monitor Workspace Name</label>
-          <input id="monitorWorkspaceName" placeholder="amw-prod" />
+          <label for="monitorWorkspaceResourceId">Azure Monitor Workspace Resource ID</label>
+          <input id="monitorWorkspaceResourceId" placeholder="/subscriptions/&lt;sub-id&gt;/resourceGroups/&lt;rg&gt;/providers/Microsoft.Monitor/accounts/&lt;workspace-name&gt;" />
         </div>
         <div>
           <label for="expectedMetricName">Expected Metric Name (optional)</label>
@@ -207,11 +195,8 @@ HTML_PAGE = """<!doctype html>
 
     function collectInput() {
       return {
-        subscriptionId: byId("subscriptionId").value.trim(),
-        aksResourceGroup: byId("aksResourceGroup").value.trim(),
-        aksClusterName: byId("aksClusterName").value.trim(),
-        monitorResourceGroup: byId("monitorResourceGroup").value.trim(),
-        monitorWorkspaceName: byId("monitorWorkspaceName").value.trim(),
+        aksResourceId: byId("aksResourceId").value.trim(),
+        monitorWorkspaceResourceId: byId("monitorWorkspaceResourceId").value.trim(),
         expectedMetricName: byId("expectedMetricName").value.trim(),
       };
     }
@@ -277,14 +262,14 @@ HTML_PAGE = """<!doctype html>
 
     async function runDiagnostic() {
       const payload = collectInput();
-      const required = ["subscriptionId", "aksResourceGroup", "aksClusterName", "monitorResourceGroup", "monitorWorkspaceName"];
+      const required = ["aksResourceId", "monitorWorkspaceResourceId"];
       const missing = required.filter((k) => !payload[k]);
       if (missing.length > 0) {
         setStatus("Fill all required fields.");
         return;
       }
 
-      if (!window.confirm(`Sign in to Azure for subscription ${payload.subscriptionId}, connect to AKS ${payload.aksResourceGroup}/${payload.aksClusterName}, and update the local kubeconfig (overwriting an existing entry)? Complete authentication in any sign-in window that opens.`)) {
+      if (!window.confirm(`Sign in to Azure and connect to AKS ${payload.aksResourceId}, and update the local kubeconfig (overwriting an existing entry)? Complete authentication in any sign-in window that opens.`)) {
         setStatus("Authentication cancelled.");
         return;
       }
@@ -389,16 +374,10 @@ def build_run_args(payload: dict) -> list[str]:
         "-File",
         str(RUNBOOK_SCRIPT),
         "-ConfirmAuthentication",
-        "-SubscriptionId",
-        payload["subscriptionId"],
-        "-AksResourceGroup",
-        payload["aksResourceGroup"],
-        "-AksClusterName",
-        payload["aksClusterName"],
-        "-MonitorResourceGroup",
-        payload["monitorResourceGroup"],
-        "-MonitorWorkspaceName",
-        payload["monitorWorkspaceName"],
+        "-AksResourceId",
+        payload["aksResourceId"].strip(),
+        "-MonitorWorkspaceResourceId",
+        payload["monitorWorkspaceResourceId"].strip(),
     ]
     expected_metric = payload.get("expectedMetricName", "").strip()
     if expected_metric:
@@ -563,11 +542,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         required = [
-            "subscriptionId",
-            "aksResourceGroup",
-            "aksClusterName",
-            "monitorResourceGroup",
-            "monitorWorkspaceName",
+            "aksResourceId",
+            "monitorWorkspaceResourceId",
         ]
         missing = [field for field in required if not str(payload.get(field, "")).strip()]
         if missing:

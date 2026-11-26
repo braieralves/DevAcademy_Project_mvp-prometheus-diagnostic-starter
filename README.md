@@ -41,13 +41,12 @@ Standardize troubleshooting to reduce variation across engineers and accelerate 
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\03-prometheus-evidence-collection.ps1 `
-  -SubscriptionId "<subscription-id>" `
-  -AksResourceGroup "<aks-rg>" `
-  -AksClusterName "<aks-name>" `
-  -MonitorResourceGroup "<monitor-rg>" `
-  -MonitorWorkspaceName "<azure-monitor-workspace-name>" `
+  -AksResourceId "/subscriptions/<subscription-id>/resourceGroups/<aks-rg>/providers/Microsoft.ContainerService/managedClusters/<aks-name>" `
+  -MonitorWorkspaceResourceId "/subscriptions/<subscription-id>/resourceGroups/<monitor-rg>/providers/Microsoft.Monitor/accounts/<azure-monitor-workspace-name>" `
   -ExpectedMetricName "<optional-metric-name>"
 ```
+
+The script derives the subscription, resource group and name from the resource IDs. The Azure CLI subscription is set from the AKS resource ID; the workspace is queried by its full resource ID, so it may be in another subscription you can read.
 
 ### Authentication
 
@@ -70,22 +69,23 @@ Run `python -B -m unittest discover -s tests -p "test_*.py"` for the v2 GUI conf
 
 ## Output
 
-The script generates an `output\prom-missing-metrics-<timestamp>` folder with the following focused evidence:
+The script generates an `output\prom-missing-metrics-<timestamp>` folder. Every evidence file is plain text, and **`evidence-report.txt`** combines the summary and all other files into a single document that anyone can read. `report-summary.md` is the short summary shown by the web GUI.
 
 | Artifact | Content |
 | --- | --- |
-| `04-dcr-list.json`, `05-dce-list.json` | Full JSON resources discovered by **resource ID** from AKS associations, DCR endpoint references, and workspace default ingestion settings. This includes Azure-managed resource groups; it is not limited to the workspace resource group. Each file has an explicit discovery status and a `resources` array. Workspace defaults are distinguished from cluster-linked resources. |
-| `06-dcr-associations-aks.json` | All pages of associations on the AKS resource. |
-| `ampls-association.json` | `Associated`, `NotAssociated`, or `Unknown`, verification completeness, full AMPLS ARM IDs, and the DCE/scoped-resource evidence. Uses the cluster's DCEs, including those used by linked DCR destination workspaces. Merely having an AMPLS in a subscription or on unrelated workspace defaults does not establish a cluster association. This is not a DNS/VNet connectivity test. |
+| `evidence-report.txt` | Everything collected in one text file: summary, charts, DCR/DCE responses, logs, in-container search results, ConfigMaps and monitors, with a table of contents. |
+| `04-dcr-list.txt`, `05-dce-list.txt` | Full resource responses (JSON text) discovered by **resource ID** from AKS associations, DCR endpoint references, and workspace default ingestion settings. This includes Azure-managed resource groups; it is not limited to the workspace resource group. Each file has an explicit discovery status and a `resources` array. Workspace defaults are distinguished from cluster-linked resources. |
+| `06-dcr-associations-aks.txt` | All pages of associations on the AKS resource. |
+| `ampls-association.txt` | `Associated`, `NotAssociated`, or `Unknown`, verification completeness, full AMPLS ARM IDs, and the DCE/scoped-resource evidence. Uses the cluster's DCEs, including those used by linked DCR destination workspaces. Merely having an AMPLS in a subscription or on unrelated workspace defaults does not establish a cluster association. This is not a DNS/VNet connectivity test. |
 | `workspace-network.txt` | The requested Azure Monitor workspace's public network access setting: Enabled, Disabled, another service-provided setting, or Unknown. No workspace JSON payload is saved. |
-| `ingestion-status.txt`, `ingestion-status.json` | Actual workspace **Events per minute** and **Active time series** limits, usage, utilization percentages, peak utilization, and whether the limit was reached (`>=100%`) or exceeded (`>100%`) in the observed samples. |
-| `ingestion-counts-and-limits.json`, `ingestion-utilization.json` | Raw platform metric responses supporting ingestion conclusions. |
-| `ama-metrics-status.txt`, `ama-metrics-status.json` | Only ama-metrics pod/container status: phase, Ready, restart counts, current state, and previous termination reasons. No full kube-system pod dump is saved. |
-| `*-prometheus-collector.log`, `*-prometheus-collector-previous.log` | Current logs from each ama-metrics pod containing `prometheus-collector`, and previous-container logs when restarts are reported. Collection is bounded to the last hour and 5,000 lines per log. |
-| `ama-metrics-errors-warnings.txt` | Error/warning/fatal/exception/throttling matches from the retrieved logs, not an automated proof of health. |
+| `ingestion-status.txt` | Actual workspace **Events per minute** and **Active time series** limits, usage, utilization percentages and peak utilization, whether the limit was reached (`>=100%`) or exceeded (`>100%`) in the observed samples, and **line charts** of usage and utilization over the last 60 minutes. |
+| `ama-metrics-status.txt` | Only ama-metrics pod/container status: phase, Ready, restart counts, current state, and previous termination reasons. No full kube-system pod dump is saved. |
+| `*-prometheus-collector.txt`, `*-prometheus-collector-previous.txt` | Output of `kubectl logs <pod> -c prometheus-collector -n kube-system` for each ama-metrics pod, and the `--previous` logs when restarts are reported. |
+| `*-container-search.txt` | Search for errors, warnings, failures and similar messages inside each running Linux `prometheus-collector` container. The script runs `kubectl exec -i <pod> -c prometheus-collector -n kube-system -- /bin/bash` and sends the search commands to that shell (`-t` is omitted because a script has no terminal). It searches log and message files only (`*.log`, `*.txt`, `mdsd.*`, `*.err`, `*.warn`, `*.info`, `*.qos` under `/MetricsExtensionConsoleDebugLog.log`, `/opt/microsoft`, `/etc/prometheus`, `/tmp`), showing the last 100 matches per file. Secret-, token-, certificate- and key-like file names are skipped. |
+| `ama-metrics-errors-warnings.txt` | Error/warning/fail/fatal/exception/throttling matches from the retrieved logs and the in-container search, not an automated proof of health. |
 | `collector-files.txt`, `collector-file-errors-warnings.txt` | Read-only config and diagnostic excerpts from one running Linux `prometheus-collector`. Looks for YAML/JSON/TOML/conf and extensionless Prometheus/config/settings files under `/etc/config/settings`, `/opt/microsoft/otelcollector`, and `/etc/prometheus` (depth 4). Includes MetricsExtension and mdsd diagnostic logs when present. File sizes are printed; config content is capped at 1 MiB per file, diagnostic logs at 5,000 lines. Missing paths and unsupported Windows-only scenarios are explicit. |
-| `configmaps-status.txt`, `ama-metrics-*.yaml` | Only the four documented ConfigMaps listed below, with readable YAML when present and explicit absent/error status otherwise. |
-| `monitors-status.txt`, `*.azmonitoring.coreos.com*.yaml` | Azure PodMonitor/ServiceMonitor CRD definitions and custom-resource contents from all namespaces in readable YAML. Missing CRDs are explicit; OSS `monitoring.coreos.com` resources are not collected. |
+| `configmaps-status.txt`, `ama-metrics-*.txt` | Only the four documented ConfigMaps listed below, with readable YAML text when present and explicit absent/error status otherwise. |
+| `monitors-status.txt`, `*.azmonitoring.coreos.com*.txt` | Azure PodMonitor/ServiceMonitor CRD definitions and custom-resource contents from all namespaces as readable YAML text. Missing CRDs are explicit; OSS `monitoring.coreos.com` resources are not collected. |
 | `collection-issues.txt`, `report-summary.md` | Collection completeness, missing evidence, initial findings and evidence references. |
 
 No separate account-show, aks-show, monitor-workspace, AKS authentication, get-credentials, or full kube-system-pods artifacts are produced. Authentication still runs; credentials are not exported as evidence. Existing evidence folders from earlier versions are not modified.

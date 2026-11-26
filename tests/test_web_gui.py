@@ -18,11 +18,8 @@ gui = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(gui)
 
 PAYLOAD = {
-    "subscriptionId": "test-subscription",
-    "aksResourceGroup": "test-rg",
-    "aksClusterName": "test-aks",
-    "monitorResourceGroup": "test-monitor-rg",
-    "monitorWorkspaceName": "test-workspace",
+    "aksResourceId": "/subscriptions/test-subscription/resourceGroups/test-rg/providers/Microsoft.ContainerService/managedClusters/test-aks",
+    "monitorWorkspaceResourceId": "/subscriptions/test-subscription/resourceGroups/test-monitor-rg/providers/Microsoft.Monitor/accounts/test-workspace",
 }
 
 
@@ -65,9 +62,8 @@ class WebGuiTests(unittest.TestCase):
             script = root / "collector.ps1"
             script.write_text(
                 r"""param(
-    [string]$SubscriptionId, [string]$AksResourceGroup,
-    [string]$AksClusterName, [string]$MonitorResourceGroup,
-    [string]$MonitorWorkspaceName, [switch]$ConfirmAuthentication
+    [string]$AksResourceId, [string]$MonitorWorkspaceResourceId,
+    [switch]$ConfirmAuthentication
 )
 $ErrorActionPreference = "Stop"
 if (-not $ConfirmAuthentication) {
