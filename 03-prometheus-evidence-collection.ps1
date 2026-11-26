@@ -201,6 +201,8 @@ function New-LineChart {
     return ($lines -join "`r`n")
 }
 
+. (Join-Path $PSScriptRoot "04-technical-report-functions.ps1")
+
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) { throw "Azure CLI (az) not found. Install it before running." }
 $hasKubectl = $null -ne (Get-Command kubectl -ErrorAction SilentlyContinue)
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -255,6 +257,10 @@ kubectl @kubeArgs get nodes
 if ($LASTEXITCODE -ne 0) { throw "Cluster authentication/access failed. Check credentials, kubelogin, network access, and Kubernetes RBAC." }
 
 Write-Section "Resolving linked DCRs and DCEs by resource ID"
+# Environment details for the technical report only; failure is non-fatal and shown as Unknown.
+$aksResource = $null
+$aksLookup = Invoke-Tool -Tool az -Arguments @("rest", "--method", "get", "--url", "${aksId}?api-version=2024-05-01", "--output", "json", "--only-show-errors")
+if ($aksLookup.Success) { try { $aksResource = ConvertFrom-Json -InputObject $aksLookup.Text } catch { $aksResource = $null } }
 $associations = Get-ArmList "${aksId}/providers/Microsoft.Insights/dataCollectionRuleAssociations?api-version=2023-03-11"
 Save-Json "06-dcr-associations-aks.txt" ([ordered]@{
     status = $(if ($associations.Succeeded) { "Collected" } else { "Unknown" })
@@ -374,6 +380,7 @@ $metricArgs = @("monitor", "metrics", "list", "--resource", $workspaceId, "--nam
 $counts = Read-ToolJson az ($metricArgs + @("--metrics", "ActiveTimeSeries", "ActiveTimeSeriesLimit", "EventsPerMinuteIngested", "EventsPerMinuteIngestedLimit", "--aggregation", "Maximum"))
 $percentages = Read-ToolJson az ($metricArgs + @("--metrics", "ActiveTimeSeriesPercentUtilization", "EventsPerMinuteIngestedPercentUtilization", "--aggregation", "Average"))
 $ingestionRows = @()
+$ingestionSeries = @()
 $ingestionSections = @()
 foreach ($definition in @(
     @{ Label = "Events per minute"; Base = "EventsPerMinuteIngested" },
@@ -405,9 +412,13 @@ foreach ($definition in @(
             reachedLimitInObservedSamples = $(if ($null -eq $peak) { "Unknown" } elseif ($peak -ge 100) { "Yes" } else { "No" })
         }
         $ingestionRows += $row
+        $dimensionUsage = @($usagePoints | Where-Object { $_.Dimension -eq $dimension })
+        $dimensionLimit = @($limitPoints | Where-Object { $_.Dimension -eq $dimension })
+        $dimensionPercent = @($percentPoints | Where-Object { $_.Dimension -eq $dimension })
+        $ingestionSeries += [pscustomobject]@{ Row = $row; Usage = $dimensionUsage; Limit = $dimensionLimit; Percent = $dimensionPercent }
         $percentMax = if ($null -ne $peak -and $peak -gt 100) { $peak } else { 100 }
-        $usageChart = New-LineChart "Usage - $($definition.Label) (maximum per minute)" @($usagePoints | Where-Object { $_.Dimension -eq $dimension })
-        $utilizationChart = New-LineChart "Utilization % of limit - $($definition.Label) (average per minute, scale 0-$percentMax%)" @($percentPoints | Where-Object { $_.Dimension -eq $dimension }) "%" 0 $percentMax
+        $usageChart = New-LineChart "Usage - $($definition.Label) (maximum per minute)" $dimensionUsage
+        $utilizationChart = New-LineChart "Utilization % of limit - $($definition.Label) (average per minute, scale 0-$percentMax%)" $dimensionPercent "%" 0 $percentMax
         $ingestionSections += @"
 ============================================================
 $($definition.Label) [$dimension]
@@ -454,7 +465,7 @@ for f in $FILES; do
   n=${n:-0}
   echo
   echo "--- $f: $n matching lines"
-  if [ "$n" -gt 0 ]; then grep -inE "$PATTERN" "$f" | tail -n 100 | cut -c1-600 | sed "s|^|MATCH $f:|"; fi
+  if [ "$n" -gt 0 ]; then grep -inE "$PATTERN" "$f" | tail -n 100 | cut -c1-2000 | sed "s|^|MATCH $f:|"; fi
 done
 echo
 echo "Container search finished"
@@ -563,6 +574,7 @@ else {
 
 Write-Section "Collecting only documented scrape ConfigMaps"
 $configStatus = @()
+$configTexts = @{}
 foreach ($name in @("ama-metrics-settings-configmap", "ama-metrics-prometheus-config", "ama-metrics-prometheus-config-node", "ama-metrics-prometheus-config-node-windows")) {
     $result = Invoke-Tool kubectl ($kubeArgs + @("get", "configmap", $name, "-n", "kube-system", "--ignore-not-found", "-o", "yaml"))
     if (-not $result.Success) {
@@ -574,10 +586,16 @@ foreach ($name in @("ama-metrics-settings-configmap", "ama-metrics-prometheus-co
     }
     else {
         $configStatus += "${name}: Present - $name.txt"
+        $configTexts[$name] = $result.Text
         Save-Text (Join-Path $outDir "$name.txt") $result.Text
     }
 }
 Save-Text (Join-Path $outDir "configmaps-status.txt") ($configStatus -join "`r`n")
+$settingsConfigMap = $null
+if ($configTexts.ContainsKey("ama-metrics-settings-configmap")) {
+    $settingsJson = Invoke-Tool kubectl ($kubeArgs + @("get", "configmap", "ama-metrics-settings-configmap", "-n", "kube-system", "--ignore-not-found", "-o", "json"))
+    if ($settingsJson.Success) { try { $settingsConfigMap = ConvertFrom-Json -InputObject $settingsJson.Text } catch { $settingsConfigMap = $null } }
+}
 
 Write-Section "Collecting Azure PodMonitor and ServiceMonitor CRDs and resources"
 $monitorStatus = @()
@@ -619,6 +637,31 @@ if ($amaPods.Count -eq 0) { $hints += "No ama-metrics pods found in kube-system.
 if ($readyCount -lt $amaPods.Count) { $hints += "Some ama-metrics pods are not Ready; inspect container state and logs." }
 if ($collectionIssues.Count) { $hints += "Some checks are Unknown or failed. Review collection-issues.txt; do not treat missing evidence as healthy." }
 if ($hints.Count -eq 0) { $hints += "Review linked resources, scrape configuration, collector errors and ingestion utilization before selecting a failure domain." }
+
+$technicalReport = $null
+try {
+    $replicaPod = @($amaPods | Where-Object { $_.metadata.name -match '^ama-metrics-(?!node|ksm|win)' } | Select-Object -First 1)
+    $reportContext = @{
+        GeneratedUtc = (Get-Date).ToUniversalTime().ToString("o"); CompletionStatus = $completion
+        AksId = $aksId; WorkspaceId = $workspaceId; ExpectedMetric = $ExpectedMetricName
+        SubscriptionId = $SubscriptionId; AksResourceGroup = $AksResourceGroup; AksName = $AksClusterName; WorkspaceName = $MonitorWorkspaceName
+        Aks = $aksResource; Workspace = $workspace; NetworkAccess = $networkAccess
+        Dcrs = @($dcrs); Dces = @($dces); ClusterDcrIds = @($clusterDcrIds); AssociationsSucceeded = [bool]$associations.Succeeded
+        AmplsStatus = $amplsStatus; AmplsIds = @($amplsIds)
+        StatusRows = @($statusRows); IssueLines = @($errorLines); CollectionIssues = @($collectionIssues)
+        Ingestion = @($ingestionSeries); ConfigStatus = @($configStatus); MonitorStatus = @($monitorStatus)
+        Settings = (Get-ReportSettings $settingsConfigMap $configTexts["ama-metrics-prometheus-config"])
+        ReplicaPod = $(if ($replicaPod.Count) { $replicaPod[0].metadata.name } else { "" })
+    }
+    $technicalReport = New-TechnicalReport -Context $reportContext -OutDir $outDir
+    Save-Text (Join-Path $outDir "technical-report.html") $technicalReport.Html
+    Save-Text (Join-Path $outDir "technical-report.txt") $technicalReport.Text
+}
+catch {
+    Add-CollectionIssue "Technical report could not be generated: $($_.Exception.Message)"
+    $completion = "Incomplete"
+}
+$reportFindingLines = if ($null -ne $technicalReport) { @($technicalReport.Findings | ForEach-Object { "- [$($_.Severity)] $($_.Title)" }) } else { @("- Technical report unavailable; see collection-issues.txt.") }
 Save-Text (Join-Path $outDir "collection-issues.txt") $(if ($collectionIssues.Count) { $collectionIssues -join "`r`n" } else { "No collection command or data-availability issues detected." })
 $summary = @"
 # Report Summary - Missing Prometheus Metrics
@@ -653,7 +696,12 @@ Unknown is not zero. No means no exceedance observed in available one-minute sam
 ## Findings and next steps
 $(($hints | ForEach-Object { "- $_" }) -join "`r`n")
 
+## Technical report findings (details, troubleshooting and Microsoft documentation in technical-report.html)
+$($reportFindingLines -join "`r`n")
+
 ## Evidence (all plain text; everything is also combined in evidence-report.txt)
+- technical-report.html (open in a browser; includes the ingestion chart images) and technical-report.txt: environment, issues found, troubleshooting suggestions and official Microsoft documentation.
+- ingestion-*.png: ingestion charts as images.
 - 04-dcr-list.txt / 05-dce-list.txt / 06-dcr-associations-aks.txt: full linked resource responses, with explicit discovery status.
 - ampls-association.txt: cluster-linked DCE evidence and full AMPLS resource IDs.
 - workspace-network.txt: public access setting without a workspace dump.
@@ -668,13 +716,14 @@ $(($hints | ForEach-Object { "- $_" }) -join "`r`n")
 "@
 Save-Text (Join-Path $outDir "report-summary.md") $summary
 
-$reportFiles = @(Get-ChildItem -LiteralPath $outDir -File | Where-Object { $_.Name -ne "evidence-report.txt" } |
-    Sort-Object @{ Expression = { if ($_.Name -eq "report-summary.md") { 0 } else { 1 } } }, Name)
+$reportFiles = @(Get-ChildItem -LiteralPath $outDir -File | Where-Object { $_.Name -ne "evidence-report.txt" -and $_.Extension -notin @(".png", ".html") } |
+    Sort-Object @{ Expression = { switch ($_.Name) { "technical-report.txt" { 0 } "report-summary.md" { 1 } default { 2 } } } }, Name)
 $evidenceReport = [System.Text.StringBuilder]::new()
 [void]$evidenceReport.AppendLine("PROMETHEUS DIAGNOSTIC - COMPLETE EVIDENCE REPORT")
 [void]$evidenceReport.AppendLine("Generated (UTC): $((Get-Date).ToUniversalTime().ToString('o'))")
 [void]$evidenceReport.AppendLine("AKS: $aksId")
 [void]$evidenceReport.AppendLine("Monitor Workspace: $workspaceId")
+[void]$evidenceReport.AppendLine("Images: the ingestion charts are the ingestion-*.png files and are embedded in technical-report.html (text version of the charts: ingestion-status.txt).")
 [void]$evidenceReport.AppendLine("")
 [void]$evidenceReport.AppendLine("CONTENTS")
 foreach ($file in $reportFiles) { [void]$evidenceReport.AppendLine("  - $($file.Name)") }
@@ -687,4 +736,5 @@ foreach ($file in $reportFiles) {
 }
 Save-Text (Join-Path $outDir "evidence-report.txt") $evidenceReport.ToString()
 Write-Host "`nCollection $completion. Artifacts in: $outDir"
+Write-Host "Technical report: $(Join-Path $outDir 'technical-report.html')"
 if ($collectionIssues.Count) { throw "Collection is incomplete ($($collectionIssues.Count) issues). See report-summary.md and collection-issues.txt." }

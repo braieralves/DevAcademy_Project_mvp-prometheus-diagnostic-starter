@@ -71,9 +71,13 @@ Run `python -B -m unittest discover -s tests -p "test_*.py"` for the v2 GUI conf
 
 The script generates an `output\prom-missing-metrics-<timestamp>` folder. Every evidence file is plain text, and **`evidence-report.txt`** combines the summary and all other files into a single document that anyone can read. `report-summary.md` is the short summary shown by the web GUI.
 
+At the end of every collection the script also writes a **technical report** that explains the environment, the issues found and how to troubleshoot them, with links to the official Microsoft documentation. Open `technical-report.html` in a browser: the Azure Monitor workspace ingestion charts are embedded in it as images. `technical-report.txt` has the same content as text. The report is built from the collected evidence: findings are rated Critical, Warning or Informational, each with its evidence, why it matters, and suggested steps. Missing evidence is reported as Unknown, never as healthy. Absence of a finding is not proof of health.
+
 | Artifact | Content |
 | --- | --- |
-| `evidence-report.txt` | Everything collected in one text file: summary, charts, DCR/DCE responses, logs, in-container search results, ConfigMaps and monitors, with a table of contents. |
+| `technical-report.html`, `technical-report.txt` | Executive summary, environment (AKS, workspace, DCR/DCE, private link, collector pods, scrape configuration), ingestion charts, findings with troubleshooting steps, recommended troubleshooting order and official Microsoft documentation. |
+| `ingestion-*.png` | One chart image per ingestion metric (usage over time and utilization against the 100% limit). The same images are embedded in `technical-report.html`. |
+| `evidence-report.txt` | Everything collected in one text file: technical report, summary, charts, DCR/DCE responses, logs, in-container search results, ConfigMaps and monitors, with a table of contents. Images are referenced, not embedded. |
 | `04-dcr-list.txt`, `05-dce-list.txt` | Full resource responses (JSON text) discovered by **resource ID** from AKS associations, DCR endpoint references, and workspace default ingestion settings. This includes Azure-managed resource groups; it is not limited to the workspace resource group. Each file has an explicit discovery status and a `resources` array. Workspace defaults are distinguished from cluster-linked resources. |
 | `06-dcr-associations-aks.txt` | All pages of associations on the AKS resource. |
 | `ampls-association.txt` | `Associated`, `NotAssociated`, or `Unknown`, verification completeness, full AMPLS ARM IDs, and the DCE/scoped-resource evidence. Uses the cluster's DCEs, including those used by linked DCR destination workspaces. Merely having an AMPLS in a subscription or on unrelated workspace defaults does not establish a cluster association. This is not a DNS/VNet connectivity test. |

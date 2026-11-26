@@ -84,6 +84,9 @@ function az {
         elseif ($url -eq "https://management.azure.com/fixture-associations-page2") {
             Write-FixtureJson @{ value = @(@{ properties = @{ dataCollectionEndpointId = $fixtureDceId } }) }
         }
+        elseif ($url -like "${clusterId}?api-version=*") {
+            Write-FixtureJson @{ id = $clusterId; location = "canadacentral"; properties = @{ kubernetesVersion = "1.35.8"; azureMonitorProfile = @{ metrics = @{ enabled = $true } } } }
+        }
         elseif ($url -like "${workspaceId}?api-version=*") {
             $properties = @{ publicNetworkAccess = "Disabled" }
             if ($state.Scenario -ne "absent") {
@@ -200,6 +203,10 @@ function kubectl {
     elseif ($command -like "* get configmap *") {
         if ($state.Scenario -eq "configmaps-failure") { $global:LASTEXITCODE = 1; "Forbidden"; return }
         if ($state.Scenario -ne "absent" -and $command -like "* configmap ama-metrics-settings-configmap *") {
+            if ($command -like "* -o json") {
+                Write-FixtureJson @{ data = @{ "cluster-metrics" = "default-targets-scrape-enabled: |-`n  kubelet = true`nminimal-ingestion-profile: |-`n  enabled = true`n" } }
+                return
+            }
             "apiVersion: v1`nkind: ConfigMap`nmetadata:`n  name: ama-metrics-settings-configmap`ndata:`n  settings: |-`n    enabled = true"
         }
     }
@@ -307,6 +314,14 @@ try {
                 Assert-True ((Get-Content (Join-Path $run.FullName "configmaps-status.txt") -Raw) -like "*ama-metrics-prometheus-config: Not present*") "Missing optional ConfigMap absence status."
                 Assert-True (Test-Path (Join-Path $run.FullName "podmonitors.azmonitoring.coreos.com.txt")) "Missing monitor content."
                 if ($scenario -eq "gui-confirmation") { Assert-True ($state.Prompts.Count -eq 0) "GUI still needs console confirmation." }
+                $reportText = Get-Content (Join-Path $run.FullName "technical-report.txt") -Raw
+                $reportHtml = Get-Content (Join-Path $run.FullName "technical-report.html") -Raw
+                Assert-True ($reportText.Contains("1. EXECUTIVE SUMMARY") -and $reportText.Contains("ENVIRONMENT") -and $reportText.Contains("5. RECOMMENDED TROUBLESHOOTING ORDER")) "Technical report is missing sections."
+                Assert-True ($reportText.Contains("[CRITICAL] prometheus-collector was OOMKilled in pod ama-metrics-test") -and $reportText.Contains("[CRITICAL] Ingestion limit reached: Events per minute")) "Technical report is missing the issues found."
+                Assert-True ($reportText.Contains("Minimal ingestion profile is enabled") -and $reportText.Contains("canadacentral")) "Technical report is missing configuration or environment details."
+                Assert-True ($reportText.Contains("https://learn.microsoft.com/en-us/azure/azure-monitor/containers/prometheus-metrics-troubleshoot") -and $reportText.Contains("kubectl describe pod ama-metrics-test -n kube-system")) "Technical report lacks official documentation or troubleshooting steps."
+                Assert-True ($reportHtml.Contains("data:image/png;base64,") -and @($files | Where-Object { $_.Name -like "ingestion-*.png" }).Count -ge 2) "Ingestion charts are not embedded as images in the technical report."
+                Assert-True ((Get-Content (Join-Path $run.FullName "evidence-report.txt") -Raw).Contains("FILE: technical-report.txt")) "Combined report omits the technical report."
             }
             if ($scenario -eq "absent") {
                 Assert-True ($dcr.status -eq "NotConfigured" -and $dce.status -eq "NotConfigured") "Absent resources not explicit."
@@ -329,6 +344,7 @@ try {
                 Assert-True ($amplsText -notlike "*Status: NotAssociated*" -and $amplsText -like "*Verification complete: False*") "Access failure reported as no AMPLS or as fully verified."
             }
             if ($scenario -in @("no-metrics", "metrics-denied")) {
+                Assert-True ((Get-Content (Join-Path $run.FullName "technical-report.txt") -Raw).Contains("Ingestion metric unavailable")) "Technical report treats missing metrics as healthy."
                 Assert-True (([regex]::Matches($ingestionText, "Status: Unknown")).Count -eq 2 -and $ingestionText -notlike "*Status: Measured*" -and $ingestionText -like "*No samples returned*") "Missing metrics treated as zero/healthy."
             }
         }
